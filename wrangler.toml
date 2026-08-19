@@ -1,0 +1,9 @@
+name = "tg-lottery-bot"
+main = "src/index.js"
+compatibility_date = "2025-07-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[kv_namespaces]]
+binding = "LOTTERY_KV"
+id = "你的KV_NAMESPACE_ID"
+preview_id = "你的PREVIEW_KV_ID"
