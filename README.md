@@ -1,7 +1,6 @@
 # 🎉 Telegram 抽奖机器人 v3.0 (Cloudflare Workers)
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/your-repo/tg-lottery-bot-v3)
-[![Deploy with GitHub Actions](https://github.com/actions/deploy-to-cloudflare/workflows/deploy.yml/badge.svg)](https://github.com/your-repo/tg-lottery-bot-v3/actions)
+[![Deploy with GitHub Actions](https://github.com/your-repo/tg-lottery-bot-v3/actions/workflows/deploy.yml/badge.svg)](https://github.com/your-repo/tg-lottery-bot-v3/actions)
 
 一个轻量级、无服务器的 Telegram 抽奖机器人，部署在 **Cloudflare Workers** 上，使用 **KV** 存储数据。
 
@@ -23,94 +22,37 @@
 
 ---
 
-## 🚀 方式一：一键部署（推荐）
+## 🚀 一键部署（3 步）
 
-1. Fork 或 clone 本仓库到 GitHub
-2. 在 Cloudflare Dashboard → Workers & Pages → **Create Application**
-3. 选择 **Connect to Git** → 关联你的 GitHub 仓库
-4. 配置变量（见下方 Secrets 列表）
-5. 点 **Deploy**，Cloudflare 自动构建部署
+KV 命名空间由 GitHub Actions **自动创建**，你不需要手动操作。
 
----
+### Step 1 — 配置 GitHub Secrets
 
-## 🚀 方式二：GitHub Actions 自动部署
+GitHub → 仓库 → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**，添加 **3 个**：
 
-### 步骤
+| Secret | 必填 | 在哪拿 |
+|--------|------|--------|
+| `CF_API_TOKEN` | ✅ | Cloudflare → Workers & Pages → API Tokens → 创建一个（权限：Workers Edit + KV Edit） |
+| `CF_ACCOUNT_ID` | ✅ | Cloudflare Dashboard 顶部地址栏 |
+| `BOT_TOKEN` | ✅ | Telegram [BotFather](https://t.me/BotFather) → `/newbot` |
 
-#### 1️⃣ 准备 Cloudflare API Token
+> `WEBHOOK_SECRET` 可选，不填则跳过签名验证。
 
-Cloudflare Dashboard → **Workers & Pages** → **API Tokens** → Create Token
-
-权限需要：
-- Workers: **Edit**
-- KV: **Edit**
-
-复制 Token 备用。
-
-#### 2️⃣ 准备 Bot Token
-
-[BotFather](https://t.me/BotFather) → `/newbot` → 获取 Token
-
-#### 3️⃣ 准备 KV 命名空间
-
-```bash
-npx wrangler login
-npx wrangler kv namespace create "LOTTERY_KV"
-# 复制返回的 id
-```
-
-打开 `wrangler.toml`，替换：
-```toml
-[[kv_namespaces]]
-binding = "LOTTERY_KV"
-id = "你的KV_NAMESPACE_ID"       # ← 替换
-preview_id = "你的PREVIEW_KV_ID"  # ← 替换
-```
-
-#### 4️⃣ 配置 GitHub Secrets
-
-GitHub → 仓库 → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
-
-| Secret 名称 | 值 | 来源 |
-|------------|-----|------|
-| `CF_API_TOKEN` | 上面步骤1生成的 Cloudflare Token | Cloudflare Dashboard |
-| `CF_ACCOUNT_ID` | 你的 Cloudflare Account ID | Cloudflare Dashboard → Workers & Pages → 顶部 |
-| `BOT_TOKEN` | Telegram Bot Token | BotFather |
-| `WEBHOOK_SECRET` | 随机字符串（可选） | `openssl rand -hex 32` |
-
-#### 5️⃣ 推送代码触发部署
+### Step 2 — 推代码
 
 ```bash
 git push origin main
 ```
 
-GitHub Actions 会自动执行部署。查看 **Actions** tab 确认状态。
+### Step 3 — 设置 Webhook
 
-#### 6️⃣ 设置 Webhook
-
-部署成功后，从 Actions 日志或 Cloudflare Dashboard 获取 Worker URL，设置 Webhook：
+部署成功后，从 **Actions 日志** 或 Cloudflare Dashboard 获取 Worker URL，然后：
 
 ```bash
-# 无签名密钥
-curl "https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=https://tg-lottery-bot.<your-subdomain>.workers.dev"
-
-# 有签名密钥（推荐）
-curl "https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=https://tg-lottery-bot.<your-subdomain>.workers.dev&secret_token=你的WEBHOOK_SECRET"
+curl "https://api.telegram.org/bot你的TOKEN/setWebhook?url=https://tg-lottery-bot.YOURNAME.workers.dev"
 ```
 
----
-
-## 🚀 方式三：本地 Wrangler 部署
-
-```bash
-npm install
-npx wrangler login
-npx wrangler kv namespace create "LOTTERY_KV"
-# 将 id 填入 wrangler.toml
-npx wrangler secret put BOT_TOKEN
-npx wrangler secret put WEBHOOK_SECRET   # 可选
-npx wrangler deploy
-```
+在 Telegram 发 `/start` 验证 ✅
 
 ---
 
@@ -141,7 +83,7 @@ Cloudflare Workers (Webhook)
   ├─ 幂等去重 (update_id)
   └─ 路由分发
        ↓
-Cloudflare KV
+Cloudflare KV（Actions 自动创建）
   ├─ lottery:{ID}      — 抽奖数据（含乐观锁 version）
   ├─ seen:{updateId}   — 幂等标记（30天过期）
   └─ chat:{chatId}:lotteries — 聊天室索引
@@ -151,14 +93,13 @@ Telegram API（重试 + 限流退避）
 
 ---
 
-## ⚙️ GitHub Secrets 速查
+## ⚙️ 完整 3 步速查
 
-| Secret | 必填 | 说明 |
-|--------|------|------|
-| `CF_API_TOKEN` | ✅ | Cloudflare Workers API Token（权限：Workers Edit + KV Edit） |
-| `CF_ACCOUNT_ID` | ✅ | Cloudflare Account ID |
-| `BOT_TOKEN` | ✅ | Telegram Bot Token |
-| `WEBHOOK_SECRET` | ❌ | 签名密钥，可选 |
+```
+1️⃣ GitHub Secrets → 添加 CF_API_TOKEN / CF_ACCOUNT_ID / BOT_TOKEN
+2️⃣ git push origin main  → Actions 自动创建 KV + 部署
+3️⃣ curl 设置 Webhook → 完成
+```
 
 ---
 

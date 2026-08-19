@@ -3,7 +3,8 @@ main = "src/index.js"
 compatibility_date = "2025-07-01"
 compatibility_flags = ["nodejs_compat"]
 
+# KV namespace 会由 GitHub Actions 自动创建并写入
 [[kv_namespaces]]
 binding = "LOTTERY_KV"
-id = "你的KV_NAMESPACE_ID"
-preview_id = "你的PREVIEW_KV_ID"
+id = "REPLACE_KV_ID"
+preview_id = "REPLACE_PREVIEW_ID"
