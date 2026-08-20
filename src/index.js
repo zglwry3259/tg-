@@ -33,10 +33,54 @@ export default {
   // 每分钟触发：定时开奖检查
   async scheduled(event, env, ctx) {
     ctx.waitUntil(checkScheduledDraws(env));
+    // 首次自动设置指令菜单（只需一次）
+    ctx.waitUntil(ensureCommands(env));
   },
 };
 
 // ==================== 定时开奖（Cron） ====================
+
+// 首次运行时自动设置 Bot 指令菜单（setMyCommands），KV 标记只执行一次
+async function ensureCommands(env) {
+  try {
+    const flag = await env.LOTTERY_KV.get('commands_set');
+    if (flag === '1') return;
+
+    const token = env.BOT_TOKEN || '';
+    const url = `${TELEGRAM_API}/bot${token}/setMyCommands`;
+    const privateCommands = [
+      { command: 'create', description: '✨ 创建抽奖（8步向导）' },
+      { command: 'list', description: '📋 查看我创建的抽奖' },
+      { command: 'draw', description: '🎲 手动开奖 用法: /draw <ID>' },
+      { command: 'cancel', description: '❌ 取消抽奖 用法: /cancel <ID>' },
+      { command: 'groups', description: '🤖 查看可发布群组' },
+      { command: 'start', description: '📖 帮助说明' },
+    ];
+    const groupCommands = [
+      { command: 'list', description: '📋 查看本群抽奖' },
+      { command: 'draw', description: '🎲 手动开奖 用法: /draw <ID>' },
+      { command: 'cancel', description: '❌ 取消抽奖 用法: /cancel <ID>' },
+    ];
+
+    // 私聊（默认 scope）
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ commands: privateCommands }),
+    });
+    // 群聊 scope
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: { type: 'all_group_chats' }, commands: groupCommands }),
+    });
+
+    await env.LOTTERY_KV.put('commands_set', '1');
+    console.log('Bot commands menu set.');
+  } catch (err) {
+    console.error('ensureCommands error:', err);
+  }
+}
 
 async function checkScheduledDraws(env) {
   try {
