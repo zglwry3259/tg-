@@ -1,6 +1,7 @@
 /**
- * Telegram Lottery Bot v4.1 - Cloudflare Workers
- * 私聊创建 + 发布到群聊/频道 + 口令参与 + 强制加频道 + 创建向导 + 私信中奖通知
+ * 群组管家 v5.0 - Cloudflare Workers
+ * 抽奖模块（私聊创建+发布置顶+口令参与+定时/人数开奖+私信通知）
+ * + 入群验证模块 + 管理员公告模块 + 投票模块
  */
 
 const TELEGRAM_API = 'https://api.telegram.org';
@@ -33,6 +34,7 @@ export default {
   // 每分钟触发：定时开奖检查
   async scheduled(event, env, ctx) {
     ctx.waitUntil(checkScheduledDraws(env));
+    ctx.waitUntil(checkPendingVerifications(env));
     // 首次自动设置指令菜单（只需一次）
     ctx.waitUntil(ensureCommands(env));
   },
@@ -43,7 +45,7 @@ export default {
 // 首次运行时自动设置 Bot 指令菜单（setMyCommands），KV 标记只执行一次
 async function ensureCommands(env) {
   try {
-    const flag = await env.LOTTERY_KV.get('commands_set');
+    const flag = await env.LOTTERY_KV.get('commands_set_v5');
     if (flag === '1') return;
 
     const token = env.BOT_TOKEN || '';
@@ -60,6 +62,9 @@ async function ensureCommands(env) {
       { command: 'list', description: '📋 查看本群抽奖' },
       { command: 'draw', description: '🎲 手动开奖 用法: /draw <ID>' },
       { command: 'cancel', description: '❌ 取消抽奖 用法: /cancel <ID>' },
+      { command: 'announce', description: '📢 管理员公告（自动置顶）' },
+      { command: 'poll', description: '📊 发起投票 用法: /poll 问题|选项1|选项2' },
+      { command: 'verify', description: '🛡️ 入群验证开关: /verify on|off' },
     ];
 
     // 私聊（默认 scope）
@@ -75,7 +80,7 @@ async function ensureCommands(env) {
       body: JSON.stringify({ scope: { type: 'all_group_chats' }, commands: groupCommands }),
     });
 
-    await env.LOTTERY_KV.put('commands_set', '1');
+    await env.LOTTERY_KV.put('commands_set_v5', '1');
     console.log('Bot commands menu set.');
   } catch (err) {
     console.error('ensureCommands error:', err);
@@ -139,6 +144,7 @@ async function handleUpdate(update, env) {
   if (update.message) await handleMessage(update.message, env);
   else if (update.callback_query) await handleCallbackQuery(update.callback_query, env);
   else if (update.my_chat_member) await handleMyChatMember(update.my_chat_member, env);
+  else if (update.chat_member) await handleChatMember(update.chat_member, env);
 }
 
 async function handleMessage(msg, env) {
@@ -174,6 +180,15 @@ async function handleMessage(msg, env) {
     }
     if (cmdLower === '/groups') {
       return refreshGroupsCmd(chatId, userId, env);
+    }
+    if (cmdLower === '/announce' || cmdLower === '/notice') {
+      return announceCmd(chatId, userId, args.join(' '), env, chatTitle);
+    }
+    if (cmdLower === '/poll' || cmdLower === '/vote') {
+      return pollCmd(chatId, args.join(' '), env);
+    }
+    if (cmdLower === '/verify') {
+      return verifyCmd(chatId, userId, args[0] || '', env);
     }
     return;
   }
@@ -217,6 +232,254 @@ async function getBotGroups(env) {
   if (!raw) return [];
   const groups = JSON.parse(raw);
   return Array.isArray(groups) ? groups : [];
+}
+
+// ==================== 入群验证 ====================
+
+// 群聊/频道成员变动：新成员加入时触发入群验证
+async function handleChatMember(mcm, env) {
+  const chat = mcm.chat;
+  if (!chat || (chat.type !== 'group' && chat.type !== 'supergroup')) return;
+
+  const newMember = mcm.new_chat_member;
+  const userId = newMember?.user?.id;
+  if (!userId) return;
+
+  // bot 自己加入时由 my_chat_member 处理，跳过
+  const botId = parseInt((env.BOT_TOKEN || '').split(':')[0]);
+  if (userId === botId) return;
+
+  const oldStatus = mcm.old_chat_member?.status || '';
+  const newStatus = newMember.status || '';
+
+  // 只处理真正的成员加入（left/kicked → member），避免解除禁言(restricted→member)等误判
+  if (oldStatus !== 'left' && oldStatus !== 'kicked') return;
+  if (newStatus !== 'member' && newStatus !== 'restricted') return;
+
+  // 读取该群验证开关（默认开启）
+  const cfgRaw = await env.LOTTERY_KV.get(`verify_cfg:${chat.id}`);
+  let cfg = { enabled: true };
+  if (cfgRaw) {
+    try { cfg = JSON.parse(cfgRaw); } catch {}
+  }
+  if (!cfg.enabled) return;
+
+  // 检查 bot 是否有管理员权限（能否禁言/踢人）
+  const botAdmin = await isBotAdmin(chat.id, env);
+
+  const name = newMember.user.username || newMember.user.first_name || `用户${userId}`;
+
+  // 禁言新成员（若 bot 是管理员）
+  let muted = false;
+  if (botAdmin) {
+    const rest = await tgApi(env, 'restrictChatMember', {
+      chat_id: chat.id,
+      user_id: userId,
+      permissions: allPermissionsObject(false),
+      until_date: Math.floor(Date.now() / 1000) + 600, // 10分钟后自动解除
+    }).catch(() => null);
+    muted = !!(rest && rest.ok);
+  }
+
+  // 记录待验证
+  const vKey = `verify_pending:${chat.id}:${userId}`;
+  const pending = {
+    chatId: chat.id,
+    userId,
+    name,
+    muted,
+    joinedAt: Date.now(),
+    msgId: null,
+  };
+  await env.LOTTERY_KV.put(vKey, JSON.stringify(pending), { expirationTtl: 660 });
+
+  // 发送验证提示消息
+  const text = `👋 欢迎 **${esc(name)}** 加入本群！\n\n🛡️ 为防广告/骚扰，请点击下方按钮完成**入群验证**，10分钟内未验证将被移出群聊。`;
+  const kb = [[{ text: '✅ 点我通过验证', callback_data: `verify_join:${chat.id}:${userId}` }]];
+  const res = await sendMsgKb(chat.id, text, kb, env).catch(() => null);
+  if (res && res.ok && res.result?.message_id) {
+    pending.msgId = res.result.message_id;
+    await env.LOTTERY_KV.put(vKey, JSON.stringify(pending), { expirationTtl: 660 });
+  }
+}
+
+// 每分钟检查：超时未验证的成员，移出群聊
+async function checkPendingVerifications(env) {
+  try {
+    const list = await env.LOTTERY_KV.list({ prefix: 'verify_pending:' });
+    if (!list.keys || list.keys.length === 0) return;
+
+    const now = Date.now();
+    for (const k of list.keys) {
+      const raw = await env.LOTTERY_KV.get(k.name);
+      if (!raw) continue;
+      let pending;
+      try { pending = JSON.parse(raw); } catch { continue; }
+      if (now - pending.joinedAt < 10 * 60 * 1000) continue; // 未超时
+
+      // 超过10分钟未验证 → 踢出（无权限踢不动则静默清理记录）
+      const kicked = await kickUser(pending.chatId, pending.userId, env);
+      await env.LOTTERY_KV.delete(k.name);
+      if (pending.msgId) {
+        await tgApi(env, 'deleteMessage', { chat_id: pending.chatId, message_id: pending.msgId }).catch(() => null);
+      }
+      if (kicked) {
+        await sendMessage(pending.chatId, `🚫 **${esc(pending.name || `用户${pending.userId}`)}** 未在10分钟内完成入群验证，已被移出群聊。`, env).catch(() => null);
+      }
+    }
+  } catch (err) {
+    console.error('checkPendingVerifications error:', err);
+  }
+}
+
+// 踢出用户（ban + unban）
+async function kickUser(chatId, userId, env) {
+  try {
+    await tgApi(env, 'banChatMember', { chat_id: chatId, user_id: userId });
+    await tgApi(env, 'unbanChatMember', { chat_id: chatId, user_id: userId });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// bot 是否是群管理员
+async function isBotAdmin(chatId, env) {
+  try {
+    const botId = parseInt((env.BOT_TOKEN || '').split(':')[0]);
+    if (!botId) return false;
+    const res = await tgApi(env, 'getChatMember', { chat_id: chatId, user_id: botId });
+    if (!res.ok) return false;
+    return ['administrator', 'creator'].includes(res.result.status);
+  } catch {
+    return false;
+  }
+}
+
+// 权限对象（restrictChatMember 用） whole=true 全部放行 / false 全部禁止（禁言）
+function allPermissionsObject(whole) {
+  const perms = {
+    can_send_messages: whole,
+    can_send_audios: whole,
+    can_send_documents: whole,
+    can_send_photos: whole,
+    can_send_videos: whole,
+    can_send_video_notes: whole,
+    can_send_voice_notes: whole,
+    can_send_polls: whole,
+    can_send_other_messages: whole,
+    can_add_web_page_previews: whole,
+    can_change_info: whole,
+    can_invite_users: whole,
+    can_pin_messages: whole,
+  };
+  return perms;
+}
+
+// ==================== 管理员公告 ====================
+
+// /announce 公告：仅群管理员可用，发布后自动置顶
+async function announceCmd(chatId, userId, text, env, chatTitle) {
+  if (chatId > 0) {
+    return sendMessage(chatId, '❌ 公告请在群聊中使用：`/announce 公告内容`', env);
+  }
+  const admin = await getChatMemberStatus(chatId, userId, env);
+  if (admin !== 'creator' && admin !== 'administrator') {
+    return sendMessage(chatId, '❌ 只有群管理员才能发布公告', env);
+  }
+  if (!text.trim()) {
+    return sendMessage(chatId, '📢 用法：`/announce 公告内容`\n发布后自动置顶。', env);
+  }
+
+  const post = `📢 **群公告**\n\n${text.trim()}\n\n— ${chatTitle || '管理组'}`;
+  const res = await sendMessage(chatId, post, env);
+  // 自动置顶
+  if (res && res.ok && res.result?.message_id) {
+    await tgApi(env, 'pinChatMessage', { chat_id: chatId, message_id: res.result.message_id, disable_notification: true }).catch(() => null);
+  }
+}
+
+// ==================== 投票 ====================
+
+// /poll 投票：问题|选项1|选项2|... 可选 --multi 多选
+async function pollCmd(chatId, text, env) {
+  if (chatId > 0) {
+    return sendMessage(chatId, '❌ 投票请在群聊中使用：`/poll 问题|选项1|选项2|...`', env);
+  }
+  if (!text.trim()) {
+    return sendMessage(chatId, '📊 用法：`/poll 问题|选项1|选项2|...`\n\n💡 示例：`/poll 今晚吃什么？|火锅|烧烤|日料`\n⚡ 多选：`/poll --multi 喜欢哪些？|A|B|C`', env);
+  }
+
+  let multi = false;
+  let body = text.trim();
+  const flagMatch = body.match(/^--(multi|anonymous|open)\b/);
+  if (flagMatch) {
+    multi = flagMatch[1] === 'multi';
+    body = body.replace(flagMatch[0], '').trim();
+  }
+
+  const parts = body.replace(/｜/g, '|').split('|').map(s => s.trim());
+  if (parts.length < 3) {
+    return sendMessage(chatId, '❌ 格式错误：至少需要 问题 + 2 个选项\n用法：`/poll 问题|选项1|选项2`', env);
+  }
+
+  const question = parts[0];
+  const options = parts.slice(1);
+  if (question.length > 300) return sendMessage(chatId, '❌ 问题过长（≤300字）', env);
+  if (options.length > 10) return sendMessage(chatId, '❌ 选项最多10个', env);
+  for (const o of options) {
+    if (o.length > 100) return sendMessage(chatId, '❌ 单个选项不能超过100字', env);
+  }
+
+  return tgApi(env, 'sendPoll', {
+    chat_id: chatId,
+    question,
+    options,
+    is_anonymous: true,
+    allows_multiple_answers: multi,
+  });
+}
+
+// ==================== 入群验证开关 ====================
+
+// /verify on|off：群管理员开启/关闭入群验证；无参数查看状态
+async function verifyCmd(chatId, userId, arg, env) {
+  if (chatId > 0) {
+    return sendMessage(chatId, '❌ 请在群聊中使用：`/verify on|off`', env);
+  }
+  const admin = await getChatMemberStatus(chatId, userId, env);
+  if (admin !== 'creator' && admin !== 'administrator') {
+    return sendMessage(chatId, '❌ 只有群管理员才能设置入群验证', env);
+  }
+
+  const cfgKey = `verify_cfg:${chatId}`;
+  const cfgRaw = await env.LOTTERY_KV.get(cfgKey);
+  let cfg = { enabled: true };
+  if (cfgRaw) {
+    try { cfg = JSON.parse(cfgRaw); } catch {}
+  }
+
+  const a = (arg || '').toLowerCase();
+  if (a === 'on' || a === '1' || a === '开') {
+    cfg.enabled = true;
+    await env.LOTTERY_KV.put(cfgKey, JSON.stringify(cfg));
+    return sendMessage(chatId, '✅ 入群验证已开启：新成员需点击验证按钮后方可发言。', env);
+  }
+  if (a === 'off' || a === '0' || a === '关') {
+    cfg.enabled = false;
+    await env.LOTTERY_KV.put(cfgKey, JSON.stringify(cfg));
+    return sendMessage(chatId, '⛔ 入群验证已关闭。', env);
+  }
+  return sendMessage(chatId, `🛡️ 入群验证当前状态：**${cfg.enabled ? '开启 ✅' : '关闭 ❌'}**\n\n用法：\`/verify on\` 开启 · \`/verify off\` 关闭`, env);
+}
+
+// 获取成员身份：creator / administrator / member / ...
+async function getChatMemberStatus(chatId, userId, env) {
+  try {
+    const res = await tgApi(env, 'getChatMember', { chat_id: chatId, user_id: userId });
+    if (res.ok && res.result?.status) return res.result.status;
+  } catch {}
+  return '';
 }
 // ==================== 创建向导（私聊） ====================
 
@@ -444,6 +707,46 @@ async function handleCallbackQuery(cb, env) {
       return answerCb(cb.id, '已取消', env);
     }
 
+    if (action === 'verify_join') {
+      // data 格式: verify_join:<chatId>:<userId>
+      const ps = param.split(':');
+      const verifyChatId = parseInt(ps[0]);
+      const verifyUserId = parseInt(ps[1]);
+      if (!verifyChatId || !verifyUserId) return answerCb(cb.id, '无效请求', env);
+
+      // 校验点击者就是待验证用户本人
+      if (userId !== verifyUserId) {
+        return answerCb(cb.id, '⚠️ 请本人点击验证', env);
+      }
+
+      const vKey = `verify_pending:${verifyChatId}:${verifyUserId}`;
+      const vRaw = await env.LOTTERY_KV.get(vKey);
+      if (!vRaw) {
+        return answerCb(cb.id, '⏳ 验证已过期或已完成', env);
+      }
+      const pending = JSON.parse(vRaw);
+
+      // 解除禁言（若已禁言）
+      if (pending.muted) {
+        await tgApi(env, 'restrictChatMember', {
+          chat_id: verifyChatId,
+          user_id: verifyUserId,
+          permissions: allPermissionsObject(true),
+        }).catch(() => null);
+      }
+
+      // 删除待验证记录
+      await env.LOTTERY_KV.delete(vKey);
+      // 删除验证提示消息
+      if (pending.msgId) {
+        await tgApi(env, 'deleteMessage', { chat_id: verifyChatId, message_id: pending.msgId }).catch(() => null);
+      }
+
+      const name = pending.name || `用户${verifyUserId}`;
+      await sendMessage(verifyChatId, `✅ **${esc(name)}** 验证通过，欢迎加入本群！🎉`, env).catch(() => null);
+      return answerCb(cb.id, '✅ 验证成功', env);
+    }
+
     await answerCb(cb.id, '', env);
   } catch (err) {
     console.error('Callback error:', err);
@@ -478,6 +781,8 @@ async function finishWizard(chatId, msgId, userId, wizard, env) {
     status: 'active',
     createdAt: now,
     drawnAt: null,
+    groupMsgId: null,   // 群公告消息ID（置顶/取消置顶用）
+    channelMsgId: null, // 频道公告消息ID
   };
 
   if (!lottery.groupId) {
@@ -514,14 +819,39 @@ ${triggerText}${channelText}
 
 🔑 在群内发送口令 \`${lottery.keyword}\` 即可参与抽奖！`;
 
+  let groupMsgId = null;
   if (botInGroup) {
-    await sendMessage(lottery.groupId, groupPost, env);
+    const postRes = await sendMessage(lottery.groupId, groupPost, env);
+    if (postRes && postRes.ok && postRes.result?.message_id) {
+      groupMsgId = postRes.result.message_id;
+      lottery.groupMsgId = groupMsgId; // 记录公告消息ID（开奖/取消时取消置顶）
+    }
   }
 
   // 发布到频道（如有）
+  let channelMsgId = null;
   if (lottery.channel) {
-    try { await sendMessage(lottery.channel, groupPost, env); } catch {}
+    try {
+      const chRes = await sendMessage(lottery.channel, groupPost, env);
+      if (chRes && chRes.ok && chRes.result?.message_id) {
+        channelMsgId = chRes.result.message_id;
+        lottery.channelMsgId = channelMsgId;
+      }
+    } catch {}
   }
+
+  // 自动置顶：群公告置顶（需要 bot 有 pin 权限，失败静默）
+  if (lottery.groupId && groupMsgId) {
+    try {
+      await tgApi(env, 'pinChatMessage', {
+        chat_id: lottery.groupId,
+        message_id: groupMsgId,
+        disable_notification: false,
+      });
+    } catch {}
+  }
+  // 同步存储（含置顶信息）
+  await env.LOTTERY_KV.put(`lottery:${lotteryId}`, JSON.stringify(lottery));
 
   // 私聊给创建者确认
   const botWarn = botInGroup
@@ -661,6 +991,13 @@ async function executeDraw(lotteryId, lottery, env, chatTitle) {
   await env.LOTTERY_KV.put(`lottery:${lotteryId}`, JSON.stringify(lottery));
   await removeFromScheduled(env, lotteryId);
 
+  // 开奖后取消原公告置顶（若仍有置顶）
+  if (lottery.groupMsgId) {
+    try {
+      await tgApi(env, 'unpinChatMessage', { chat_id: lottery.groupId, message_id: lottery.groupMsgId });
+    } catch {}
+  }
+
   const winnerNames = winners.map(id => lottery.participantNames[id] || `用户${id}`);
 
   // 群内公告
@@ -738,6 +1075,12 @@ async function cancelLotteryCmd(chatId, userId, lotteryId, env, chatTitle) {
   lottery.status = 'cancelled';
   await env.LOTTERY_KV.put(`lottery:${lotteryId}`, JSON.stringify(lottery));
   await removeFromScheduled(env, lotteryId);
+  // 取消时也取消置顶
+  if (lottery.groupMsgId) {
+    try {
+      await tgApi(env, 'unpinChatMessage', { chat_id: lottery.groupId, message_id: lottery.groupMsgId });
+    } catch {}
+  }
   return sendMessage(chatId, `✅ 抽奖 \`${lotteryId}\` 已取消`, env);
 }
 

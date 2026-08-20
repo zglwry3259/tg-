@@ -1,7 +1,7 @@
 {
-  "name": "tg-lottery-bot",
-  "version": "4.1.0",
-  "description": "Telegram 抽奖机器人 v4.1 - 私聊创建+发布群/频道",
+  "name": "tg-group-bot",
+  "version": "5.0.0",
+  "description": "群组管家 v5.0 - 抽奖+入群验证+管理员公告+投票",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
@@ -13,6 +13,8 @@
     "telegram",
     "bot",
     "lottery",
+    "poll",
+    "group-manager",
     "cloudflare-workers",
     "kv"
   ],

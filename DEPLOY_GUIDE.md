@@ -1,7 +1,13 @@
-# 🚀 抽奖机器人 v4.1 详细部署教程（小白版）
+# 🚀 群组管家 v5.0 详细部署教程（小白版）
 
-> 目标：把「私聊创建 + 发布群/频道」的 Telegram 抽奖机器人部署到 Cloudflare Workers，
+> 目标：把「抽奖 + 入群验证 + 管理员公告 + 投票」的 Telegram 群组管家部署到 Cloudflare Workers，
 > 并接上 GitHub Actions 实现「推代码自动部署」。
+
+**v5.0 新增功能（相比 v4.1）：**
+- 🛡️ **入群验证**：新人入群自动禁言 + 发验证按钮，点击后解禁；10分钟未验证自动移出（`/verify on|off` 按群开关）
+- 📢 **管理员公告**：群管理员 `/announce 内容` 发公告并**自动置顶**
+- 📌 **抽奖公告自动置顶**：创建抽奖后公告自动 pin，开奖/取消时自动取消置顶
+- 📊 **投票**：`/poll 问题|选项1|选项2` 发起匿名群投票（`--multi` 多选）
 
 ---
 
@@ -211,7 +217,7 @@ node scripts/setWebhook.mjs 123456789:AAFxxxx https://tg-lottery-bot.example.wor
 ```bash
 curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
   -H "Content-Type: application/json" \
-  -d '{"url":"https://tg-lottery-bot.<你的子域>.workers.dev/webhook","secret_token":"my-secret-2026","allowed_updates":["message","callback_query","my_chat_member"]}'
+  -d '{"url":"https://tg-lottery-bot.<你的子域>.workers.dev/webhook","secret_token":"my-secret-2026","allowed_updates":["message","callback_query","my_chat_member","chat_member"]}'
 ```
 
 ### 验证

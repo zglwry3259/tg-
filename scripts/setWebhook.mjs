@@ -10,7 +10,7 @@ if (!token || !url) {
   process.exit(1);
 }
 
-const body = { url, allowed_updates: ['message', 'callback_query', 'my_chat_member'] };
+const body = { url, allowed_updates: ['message', 'callback_query', 'my_chat_member', 'chat_member'] };
 if (secret) body.secret_token = secret;
 
 const res = await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
