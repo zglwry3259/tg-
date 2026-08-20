@@ -1,5 +1,5 @@
 /**
- * 群组管家 v6.6.1 - Cloudflare Workers
+ * 群组管家 v6.7.1 - Cloudflare Workers
  * 抽奖模块（私聊创建+多奖品+发布置顶+口令参与+定时/人数开奖+私信通知+中奖兑奖）
  * + 入群验证模块 + 管理员公告模块 + 投票模块
  */
@@ -183,10 +183,10 @@ async function handleMessage(msg, env) {
       const menuKb = [
         [{ text: '✨ 创建抽奖', callback_data: 'menu:create' }, { text: '📢 发布公告', callback_data: 'menu:announce' }],
         [{ text: '📊 发起投票', callback_data: 'menu:poll' }, { text: '📋 我的抽奖', callback_data: 'menu:list' }],
-        [{ text: '⚙️ 设置群组', callback_data: 'menu:groups' }, { text: '⚙️ 设置频道', callback_data: 'menu:channels' }],
-        [{ text: '🌏 设置时区', callback_data: 'menu:timezone' }],
+        [{ text: '🛡️ 群管理', callback_data: 'menu:mod' }, { text: '⚙️ 设置群组', callback_data: 'menu:groups' }],
+        [{ text: '⚙️ 设置频道', callback_data: 'menu:channels' }, { text: '🌏 设置时区', callback_data: 'menu:timezone' }],
       ];
-      return sendMsgKb(chatId, '🎉 **群组管家 v6.6.1**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', menuKb, env);
+      return sendMsgKb(chatId, '🎉 **群组管家 v6.7.1**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 🛡️ 群管理 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', menuKb, env);
     }
     if (cmdLower === '/create') {
       return startWizard(chatId, userId, username, chatTitle, env);
@@ -212,6 +212,9 @@ async function handleMessage(msg, env) {
     if (cmdLower === '/verify') {
       return verifyCmd(chatId, userId, args[0] || '', env);
     }
+    if (cmdLower === '/diag' || cmdLower === '/status') {
+      return diagCmd(chatId, userId, env);
+    }
     // 群管命令：mute/kick/ban/warn/del/pin/rules/welcome/lock 等（仅在群聊中生效）
     if (MOD_CMD_LIST.includes(cmdLower)) {
       return handleModCmd(chatId, userId, cmdLower, args.join(' '), msg, chatTitle, env);
@@ -219,11 +222,15 @@ async function handleMessage(msg, env) {
     return;
   }
 
-  // ---- 私聊：验证答案 / 向导步骤 / 投票 / 公告 草稿 ----
+  // ---- 私聊：验证答案 / 群管理向导 / 向导步骤 / 投票 / 公告 草稿 ----
   if (chatType === 'private') {
     // 有进行中的入群加减法验证 → 优先当答案处理
     const handledVerify = await tryVerifyAnswer(chatId, userId, text, env);
     if (handledVerify) return;
+
+    // 群管理向导：等待转发消息 / 输入内容
+    const handledMod = await handleModDraft(chatId, userId, msg, env);
+    if (handledMod) return;
     // 公告待输入：把本条消息当公告内容
     const announcePending = await env.LOTTERY_KV.get(`announce_pending:${userId}`);
     if (announcePending) {
@@ -277,6 +284,15 @@ async function handleMyChatMember(mcm, env) {
     const g = { id: chat.id, title: chat.title || (isChannel ? `频道${chat.id}` : `群${chat.id}`) };
     if (idx >= 0) list[idx] = g;
     else list.push(g);
+
+    // 群内提示：bot 加入/晋升管理员时，检查权限并提醒
+    if (isGroup) {
+      const admin = await isBotAdmin(chat.id, env);
+      const text = admin
+        ? '👋 **大家好，我是群组管家 bot！**\n\n✅ bot 已具备群管理权限，抽奖/入群验证/群管功能可用。\n\n👮 群管理员可私聊 bot 使用 🛡️ 群管理 功能。'
+        : '👋 **大家好，我是群组管家 bot！**\n\n⚠️ **请把我设为群管理员**（成员列表 → 设为管理员，勾选权限）。\n\n否则以下功能不可用：\n🔸 入群验证（加减法防广告，收不到新人入群事件）\n🔸 禁言 / 踢出 / 封禁 等群管操作\n🔸 公告/抽奖 置顶\n\n设好管理员后，bot 会自动发确认消息。';
+      await sendMessage(chat.id, text, env).catch(() => {});
+    }
   }
   await env.LOTTERY_KV.put(key, JSON.stringify(list));
 }
@@ -865,6 +881,67 @@ async function verifyCmd(chatId, userId, arg, env) {
   return sendMessage(chatId, `🛡️ 入群验证当前状态：**${cfg.enabled ? '开启 ✅' : '关闭 ❌'}**\n\n用法：\`/verify on\` 开启 · \`/verify off\` 关闭`, env);
 }
 
+// /diag：诊断入群验证为何不生效（Webhook 配置 + bot 管理员状态）
+async function diagCmd(chatId, userId, env) {
+  if (chatId < 0) {
+    return sendMessage(chatId, '❌ 请在私聊中使用：`/diag`', env);
+  }
+  const lines = [];
+  lines.push('🔍 **入群验证诊断**\n');
+
+  // 1. Webhook 配置
+  try {
+    const res = await tgApi(env, 'getWebhookInfo', {});
+    if (!res.ok) {
+      lines.push('🌐 **Webhook**：查询失败');
+    } else {
+      const info = res.result || {};
+      const allowed = (info.allowed_updates || []).join(', ') || '（无限制=全部）';
+      lines.push(`🌐 **Webhook**：\nURL: \`${info.url || '（未设置）'}\`\nallowed_updates: \`${allowed}\`\n待处理队列: ${info.pending_update_count ?? '?'}`);
+      const hasChatMember = !info.allowed_updates || info.allowed_updates.includes('chat_member');
+      lines.push(`chat_member 事件: ${hasChatMember ? '✅ 已包含' : '❌ 未包含（入群验证收不到！）'}`);
+      if (!hasChatMember) {
+        lines.push('  🔧 修复：用 `scripts/setWebhook.mjs` 重设 Webhook（已自动包含 chat_member）');
+      }
+    }
+  } catch (err) {
+    lines.push(`🌐 **Webhook**：查询失败（${err.message || err}）`);
+  }
+
+  // 2. bot 在每个群的管理员状态
+  try {
+    const groups = await getBotGroups(env);
+    if (!groups.length) {
+      lines.push('\n👥 **bot 所在群**：还没有记录到群（bot 加入群后需重新部署/等 my_chat_member 事件）');
+    } else {
+      lines.push(`\n👥 **bot 所在群**（${groups.length}）：`);
+      for (const g of groups) {
+        const admin = await isBotAdmin(g.id, env);
+        lines.push(`- ${esc(g.title || `群 ${g.id}`)}：${admin ? '✅ 管理员' : '❌ 非管理员（收不到入群事件，无法禁言/踢人！）'}`);
+      }
+      lines.push('  🔧 修复：在群里把 bot 设为**管理员**（否则 Telegram 不会推送成员加入事件）');
+    }
+  } catch (err) {
+    lines.push(`\n👥 **bot 所在群**：读取失败（${err.message || err}）`);
+  }
+
+  // 3. 验证开关
+  try {
+    const groups = await getBotGroups(env);
+    if (groups.length) {
+      lines.push('\n⚙️ **入群验证开关**：');
+      for (const g of groups) {
+        const raw = await env.LOTTERY_KV.get(`verify_cfg:${g.id}`);
+        let enabled = true;
+        if (raw) { try { enabled = JSON.parse(raw).enabled; } catch {} }
+        lines.push(`- ${esc(g.title || `群 ${g.id}`)}：${enabled ? '开启 ✅' : '关闭 ❌'}`);
+      }
+    }
+  } catch {}
+
+  return sendMessage(chatId, lines.join('\n'), env);
+}
+
 // 获取成员身份：creator / administrator / member / ...
 async function getChatMemberStatus(chatId, userId, env) {
   try {
@@ -1125,6 +1202,333 @@ async function handleModCmd(chatId, userId, cmd, arg, msg, chatTitle, env) {
   }
 
   return null;
+}
+
+// ==================== 群管理（私聊向导） ====================
+
+// 群管理主入口：列出 bot 已加入的群
+async function showModStart(chatId, msgId, env, userId) {
+  const groups = await getBotGroups(env);
+  if (!groups.length) {
+    await editMsg(chatId, msgId, '🛡️ **群管理**\n\n❌ bot 尚未加入任何群。\n请先把 bot 拉进群并设为管理员，再在这里管理。', env);
+    return;
+  }
+  const kb = [];
+  for (const g of groups) {
+    kb.push([{ text: `🏘 ${esc(g.title || `群 ${g.id}`)}`, callback_data: `mod_pick:${g.id}` }]);
+  }
+  kb.push([{ text: '🏠 主菜单', callback_data: 'menu_back' }]);
+  await editMsg(chatId, msgId, '🛡️ **群管理**\n\n选择要管理的群：', env, kb);
+}
+
+// 群操作菜单（校验管理员）
+async function showModActions(chatId, msgId, env, userId, groupId) {
+  const groups = await getBotGroups(env);
+  const g = groups.find(x => x.id === groupId);
+  const gname = g?.title || `群 ${groupId}`;
+
+  const admin = await getChatMemberStatus(groupId, userId, env);
+  if (!isAdminStatus(admin)) {
+    await editMsg(chatId, msgId, `🛡️ **${esc(gname)}**\n\n❌ 你不是该群管理员，无法管理。`, env);
+    return;
+  }
+
+  const kb = [
+    [{ text: '🔇 禁言', callback_data: `mod_pick:${groupId}:mute` }, { text: '🔊 解除禁言', callback_data: `mod_pick:${groupId}:unmute` }],
+    [{ text: '👢 踢出', callback_data: `mod_pick:${groupId}:kick` }, { text: '🚫 封禁', callback_data: `mod_pick:${groupId}:ban` }, { text: '✅ 解封', callback_data: `mod_pick:${groupId}:unban` }],
+    [{ text: '⚠️ 警告', callback_data: `mod_pick:${groupId}:warn` }, { text: '📋 查警告', callback_data: `mod_pick:${groupId}:warns` }],
+    [{ text: '📜 设置群规', callback_data: `mod_pick:${groupId}:rules` }, { text: '👋 设置欢迎语', callback_data: `mod_pick:${groupId}:welcome` }, { text: '✏️ 改群名', callback_data: `mod_pick:${groupId}:settitle` }],
+    [{ text: '🔒 全员禁言', callback_data: `mod_pick:${groupId}:lock` }, { text: '🔓 解除全员禁言', callback_data: `mod_pick:${groupId}:unlock` }],
+    [{ text: '🛡️ 管理员列表', callback_data: `mod_pick:${groupId}:admins` }, { text: 'ℹ️ 群信息', callback_data: `mod_pick:${groupId}:info` }],
+    [{ text: '⬅️ 返回选群', callback_data: 'mod_back_list' }, { text: '🏠 主菜单', callback_data: 'menu_back' }],
+  ];
+  await editMsg(chatId, msgId, `🛡️ **群管理** — ${esc(gname)}（\`${groupId}\`）\n\n选择操作：`, env, kb);
+}
+
+// 处理操作选择：需目标用户 → 引导转发/输入ID；需文本 → 提示输入；其余直接执行
+async function modAct(chatId, msgId, userId, groupId, action, env) {
+  const groups = await getBotGroups(env);
+  const g = groups.find(x => x.id === groupId);
+  const gname = g?.title || `群 ${groupId}`;
+
+  const admin = await getChatMemberStatus(groupId, userId, env);
+  if (!isAdminStatus(admin)) {
+    await editMsg(chatId, msgId, `❌ 你不是该群管理员。`, env);
+    return;
+  }
+
+  // 直接执行类
+  if (action === 'lock' || action === 'unlock' || action === 'admins' || action === 'info') {
+    await modExecAction(chatId, msgId, env, groupId, action, null, '', '');
+    return;
+  }
+
+  // 禁言：先选时长
+  if (action === 'mute') {
+    const kb = [
+      [{ text: '10分钟', callback_data: `mod_setmute:${groupId}:10m` }, { text: '30分钟', callback_data: `mod_setmute:${groupId}:30m` }],
+      [{ text: '1小时', callback_data: `mod_setmute:${groupId}:1h` }, { text: '1天', callback_data: `mod_setmute:${groupId}:1d` }],
+      [{ text: '永久', callback_data: `mod_setmute:${groupId}:forever` }],
+      [{ text: '⬅️ 返回', callback_data: `mod_back:${groupId}` }, { text: '❌ 取消', callback_data: 'mod_cancel' }],
+    ];
+    await editMsg(chatId, msgId, `🔇 **禁言** — ${esc(gname)}\n\n请选择禁言时长：`, env, kb);
+    return;
+  }
+
+  // 需要目标用户的操作：引导转发消息或输入用户ID
+  const needTarget = ['unmute', 'kick', 'ban', 'unban', 'unwarn', 'warns'];
+  if (needTarget.includes(action)) {
+    await env.LOTTERY_KV.put(`mod_draft:${userId}`, JSON.stringify({ groupId, action, step: 'target', groupName: gname }), { expirationTtl: 900 });
+    const kb = [[{ text: '⬅️ 返回', callback_data: `mod_back:${groupId}` }, { text: '❌ 取消', callback_data: 'mod_cancel' }]];
+    await editMsg(chatId, msgId, `🛡️ **${modActionLabel(action)}** — ${esc(gname)}\n\n请**转发**目标用户在群里的任意一条消息给我，\n或直接发送该用户的 **ID 数字**：`, env, kb);
+    return;
+  }
+
+  // 警告：需要目标 + 可选原因
+  if (action === 'warn') {
+    await env.LOTTERY_KV.put(`mod_draft:${userId}`, JSON.stringify({ groupId, action, step: 'target', groupName: gname }), { expirationTtl: 900 });
+    const kb = [[{ text: '⬅️ 返回', callback_data: `mod_back:${groupId}` }, { text: '❌ 取消', callback_data: 'mod_cancel' }]];
+    await editMsg(chatId, msgId, `⚠️ **警告** — ${esc(gname)}\n\n请转发目标用户的消息或发送其用户 ID（可选：一起发送原因，如 \`12345 广告刷屏\`）：`, env, kb);
+    return;
+  }
+
+  // 需要文本内容：群规 / 欢迎语 / 群名
+  const needText = ['rules', 'welcome', 'settitle'];
+  if (needText.includes(action)) {
+    await env.LOTTERY_KV.put(`mod_draft:${userId}`, JSON.stringify({ groupId, action, step: 'text', groupName: gname }), { expirationTtl: 900 });
+    const kb = [[{ text: '⬅️ 返回', callback_data: `mod_back:${groupId}` }, { text: '❌ 取消', callback_data: 'mod_cancel' }]];
+    const prompt = {
+      rules: `📜 **设置群规** — ${esc(gname)}\n\n请直接发送群规内容（≤2000字）：`,
+      welcome: `👋 **设置欢迎语** — ${esc(gname)}\n\n请直接发送欢迎语内容（≤500字）；\n\`{name}\` 会自动替换为新成员名；\n发送 \`off\` 可关闭欢迎语：`,
+      settitle: `✏️ **修改群名** — ${esc(gname)}\n\n请直接发送新群名（≤128字）：`,
+    }[action];
+    await editMsg(chatId, msgId, prompt, env, kb);
+    return;
+  }
+
+  await showModActions(chatId, msgId, env, userId, groupId);
+}
+
+// 禁言选完时长：进入目标输入
+async function modAwaitTarget(chatId, msgId, userId, groupId, action, arg, env) {
+  const groups = await getBotGroups(env);
+  const g = groups.find(x => x.id === groupId);
+  const gname = g?.title || `群 ${groupId}`;
+  await env.LOTTERY_KV.put(`mod_draft:${userId}`, JSON.stringify({ groupId, action: 'mute', step: 'target', arg, groupName: gname }), { expirationTtl: 900 });
+  const kb = [[{ text: '⬅️ 返回', callback_data: `mod_back:${groupId}` }, { text: '❌ 取消', callback_data: 'mod_cancel' }]];
+  await editMsg(chatId, msgId, `🔇 **禁言**（${arg}）— ${esc(gname)}\n\n请**转发**目标用户在群里的任意一条消息给我，\n或直接发送该用户的 **ID 数字**：`, env, kb);
+}
+
+function modActionLabel(action) {
+  return { mute: '禁言', unmute: '解除禁言', kick: '踢出', ban: '封禁', unban: '解封', warn: '警告', unwarn: '撤销警告', warns: '查看警告', rules: '设置群规', welcome: '设置欢迎语', settitle: '修改群名' }[action] || action;
+}
+
+// 私聊收到消息时处理 mod_draft（转发消息 / 纯文本ID / 文本内容）
+async function handleModDraft(chatId, userId, msg, env) {
+  if (chatId < 0) return false;
+  const raw = await env.LOTTERY_KV.get(`mod_draft:${userId}`);
+  if (!raw) return false;
+  const draft = JSON.parse(raw);
+  const { groupId, action, step, arg, groupName } = draft;
+  const text = (msg.text || '').trim();
+
+  if (step === 'target') {
+    // 解析目标用户：优先转发消息里的 sender
+    let targetId = null;
+    let targetName = '';
+    let warnReason = arg || '';
+    const fo = msg.forward_origin || null;
+    if (fo && fo.type === 'user' && fo.sender_user) {
+      targetId = fo.sender_user.id;
+      targetName = fo.sender_user.username ? `@${fo.sender_user.username}` : (fo.sender_user.first_name || `用户${targetId}`);
+    } else if (msg.forward_from) {
+      targetId = msg.forward_from.id;
+      targetName = msg.forward_from.username ? `@${msg.forward_from.username}` : (msg.forward_from.first_name || `用户${targetId}`);
+    } else {
+      // 尝试纯数字/带原因
+      const m = text.match(/^(\d+)(?:\s+(.*))?$/);
+      if (!m) {
+        await sendMessage(chatId, '❌ 无法识别目标用户。请**转发**该用户在群里的消息给我，或发送纯数字**用户 ID**。', env);
+        return true;
+      }
+      targetId = parseInt(m[1]);
+      targetName = `用户${targetId}`;
+      if (m[2]) warnReason = m[2].trim();
+    }
+    if (!targetId) {
+      await sendMessage(chatId, '❌ 无法识别目标用户（仅支持转发**个人用户**的消息）。', env);
+      return true;
+    }
+
+    await env.LOTTERY_KV.delete(`mod_draft:${userId}`);
+    await modExecAction(chatId, null, env, groupId, action, targetId, targetName, warnReason);
+    return true;
+  }
+
+  if (step === 'text') {
+    if (!text) {
+      await sendMessage(chatId, '❌ 内容不能为空。', env);
+      return true;
+    }
+    await env.LOTTERY_KV.delete(`mod_draft:${userId}`);
+    await modExecAction(chatId, null, env, groupId, action, null, '', text);
+    return true;
+  }
+
+  return false;
+}
+
+// 执行群管理动作（私聊结果发送到 chatId；msgId 为 null 时另发新消息）
+async function modExecAction(chatId, msgId, env, groupId, action, targetId, targetName, arg) {
+  const sendOut = async (text) => {
+    if (msgId) await editMsg(chatId, msgId, text, env).catch(() => sendMessage(chatId, text, env));
+    else await sendMessage(chatId, text, env);
+  };
+  const botAdmin = await isBotAdmin(groupId, env);
+  const needBot = ['lock', 'unlock', 'settitle', 'mute', 'unmute', 'kick', 'ban', 'unban', 'del', 'pin'];
+
+  if (needBot.includes(action) && !botAdmin) {
+    return sendOut('❌ bot 需要**群管理员**权限才能执行该操作。\n请在群里把 bot 设为管理员后重试。');
+  }
+
+  if (action === 'admins') {
+    try {
+      const res = await tgApi(env, 'getChatAdministrators', { chat_id: groupId });
+      if (!res.ok) return sendOut('❌ 获取管理员列表失败');
+      const lines = res.result.map((a, i) => {
+        const u = a.user;
+        const name = u.username ? `@${u.username}` : (u.first_name || `用户${u.id}`);
+        const role = a.status === 'creator' ? '👑 群主' : '🛡️ 管理员';
+        return `${i + 1}. ${role} ${esc(name)}`;
+      });
+      return sendOut(`🛡️ **管理员列表**（${lines.length}）\n\n${lines.join('\n')}`);
+    } catch { return sendOut('❌ 获取管理员列表失败'); }
+  }
+
+  if (action === 'info') {
+    try {
+      const [chatRes, memRes, admRes] = await Promise.all([
+        tgApi(env, 'getChat', { chat_id: groupId }),
+        tgApi(env, 'getChatMemberCount', { chat_id: groupId }),
+        tgApi(env, 'getChatAdministrators', { chat_id: groupId }),
+      ]);
+      const title = chatRes.ok ? (chatRes.result.title || groupName || groupId) : (groupName || groupId);
+      const members = memRes.ok ? memRes.result : '?';
+      const admins = admRes.ok ? admRes.result.length : '?';
+      return sendOut(`ℹ️ **群信息**\n\n📢 群名：${esc(title)}\n👥 成员：${members}\n🛡️ 管理员：${admins}\n🆔 ID：\`${groupId}\`\n🤖 bot 管理员权限：${botAdmin ? '✅ 有' : '❌ 无（部分功能不可用）'}`);
+    } catch { return sendOut('❌ 获取群信息失败'); }
+  }
+
+  if (action === 'settitle') {
+    const title = (arg || '').trim();
+    if (!title || title.length > 128) return sendOut('❌ 群标题为空或超过128字');
+    const res = await tgApi(env, 'setChatTitle', { chat_id: groupId, title });
+    return res.ok ? sendOut(`✅ 群标题已改为：**${esc(title)}**`) : sendOut('❌ 修改失败（权限不足？）');
+  }
+
+  if (action === 'welcome') {
+    const cfg = await getGroupCfg(groupId, env);
+    const a = (arg || '').trim();
+    if (a.toLowerCase() === 'off' || a === '关') {
+      cfg.welcome = '';
+      await env.LOTTERY_KV.put(`group_cfg:${groupId}`, JSON.stringify(cfg));
+      return sendOut('🚫 欢迎语已关闭');
+    }
+    if (a.length > 500) return sendOut('❌ 欢迎语过长（≤500字）');
+    cfg.welcome = a;
+    await env.LOTTERY_KV.put(`group_cfg:${groupId}`, JSON.stringify(cfg));
+    return sendOut(`✅ 欢迎语已设置：\n\n${a}\n\n新成员加入时会自动发送（\`{name}\` 自动替换为成员名）。`);
+  }
+
+  if (action === 'rules') {
+    const cfg = await getGroupCfg(groupId, env);
+    const a = (arg || '').trim();
+    if (a.length > 2000) return sendOut('❌ 群规过长（≤2000字）');
+    cfg.rules = a;
+    await env.LOTTERY_KV.put(`group_cfg:${groupId}`, JSON.stringify(cfg));
+    return sendOut(`✅ 群规已设置：\n\n${a}`);
+  }
+
+  if (action === 'lock' || action === 'unlock') {
+    const lock = action === 'lock';
+    const res = await tgApi(env, 'setChatPermissions', { chat_id: groupId, permissions: allPermissionsObject(!lock) });
+    if (!res.ok) return sendOut('❌ 设置失败（权限不足？）');
+    const cfg = await getGroupCfg(groupId, env);
+    cfg.lock = lock;
+    await env.LOTTERY_KV.put(`group_cfg:${groupId}`, JSON.stringify(cfg));
+    return sendOut(lock ? '🔒 全员禁言已开启（除管理员外禁止发言）' : '🔓 全员禁言已解除');
+  }
+
+  if (!targetId) return sendOut('❌ 缺少目标用户');
+
+  // 禁言
+  if (action === 'mute') {
+    const parsed = parseMuteTime(arg);
+    if (!parsed) return sendOut('❌ 禁言时长格式错误');
+    const body = { chat_id: groupId, user_id: targetId, permissions: allPermissionsObject(false) };
+    if (!parsed.forever) body.until_date = Math.floor(Date.now() / 1000) + parsed.seconds;
+    const res = await tgApi(env, 'restrictChatMember', body).catch(() => null);
+    return res && res.ok
+      ? sendOut(`🔇 **${esc(targetName)}** 已被禁言 ${parsed.label}`)
+      : sendOut('❌ 禁言失败（目标已是管理员/权限不足？）');
+  }
+
+  if (action === 'unmute') {
+    const res = await tgApi(env, 'restrictChatMember', { chat_id: groupId, user_id: targetId, permissions: allPermissionsObject(true) }).catch(() => null);
+    return res && res.ok
+      ? sendOut(`🔊 **${esc(targetName)}** 已被解除禁言`)
+      : sendOut('❌ 解除禁言失败');
+  }
+
+  if (action === 'kick') {
+    const res = await kickUser(groupId, targetId, env);
+    return res ? sendOut(`👢 **${esc(targetName)}** 已被移出群聊`) : sendOut('❌ 踢出失败（权限不足？）');
+  }
+
+  if (action === 'ban') {
+    const res = await tgApi(env, 'banChatMember', { chat_id: groupId, user_id: targetId }).catch(() => null);
+    return res && res.ok ? sendOut(`🚫 **${esc(targetName)}** 已被封禁（无法再加入）`) : sendOut('❌ 封禁失败');
+  }
+
+  if (action === 'unban') {
+    const res = await tgApi(env, 'unbanChatMember', { chat_id: groupId, user_id: targetId }).catch(() => null);
+    return res && res.ok ? sendOut(`✅ **${esc(targetName)}** 已解除封禁`) : sendOut('❌ 解封失败');
+  }
+
+  if (action === 'warn') {
+    const warnKey = `warns:${groupId}:${targetId}`;
+    const raw = await env.LOTTERY_KV.get(warnKey);
+    let count = raw ? parseInt(raw) : 0;
+    count += 1;
+    await env.LOTTERY_KV.put(warnKey, String(count), { expirationTtl: 30 * 24 * 60 * 60 });
+    const reason = (arg || '').trim();
+    if (count >= 3) {
+      await env.LOTTERY_KV.delete(warnKey);
+      let kicked = false;
+      if (botAdmin) kicked = await kickUser(groupId, targetId, env);
+      return sendOut(`⚠️ **${esc(targetName)}** 警告次数已达 3 次${kicked ? '，已被移出群聊' : ''}！${reason ? `\n原因：${reason}` : ''}`);
+    }
+    return sendOut(`⚠️ **${esc(targetName)}** 警告（${count}/3）${reason ? `\n原因：${reason}` : ''}\n满 3 次将自动移出群聊`);
+  }
+
+  if (action === 'unwarn') {
+    const warnKey = `warns:${groupId}:${targetId}`;
+    const raw = await env.LOTTERY_KV.get(warnKey);
+    if (!raw) return sendOut(`ℹ️ **${esc(targetName)}** 当前没有警告记录`);
+    const count = parseInt(raw) - 1;
+    if (count <= 0) await env.LOTTERY_KV.delete(warnKey);
+    else await env.LOTTERY_KV.put(warnKey, String(count), { expirationTtl: 30 * 24 * 60 * 60 });
+    return sendOut(`✅ **${esc(targetName)}** 警告已撤销，当前 ${Math.max(count, 0)}/3`);
+  }
+
+  if (action === 'warns') {
+    const warnKey = `warns:${groupId}:${targetId}`;
+    const raw = await env.LOTTERY_KV.get(warnKey);
+    const count = raw ? parseInt(raw) : 0;
+    return sendOut(`📋 **${esc(targetName)}** 当前警告：${count}/3`);
+  }
+
+  return sendOut('❌ 未知操作');
 }
 // ==================== 创建向导（私聊） ====================
 
@@ -1387,6 +1791,55 @@ async function handleCallbackQuery(cb, env) {
         await showSettingsTimezone(chatId, msgId, env, userId);
         return answerCb(cb.id, '', env);
       }
+      if (param === 'mod') {
+        await showModStart(chatId, msgId, env, userId);
+        return answerCb(cb.id, '', env);
+      }
+    }
+
+    // ============ 群管理（私聊向导） ============
+    if (action === 'mod_pick') {
+      // param 格式: <chatId> 或 <chatId>:<action>
+      const ps = param.split(':');
+      const modGroupId = parseInt(ps[0]);
+      const modAction = ps[1] || '';
+      if (!modGroupId) return answerCb(cb.id, '无效群', env);
+      if (modAction) {
+        await modAct(chatId, msgId, userId, modGroupId, modAction, env);
+      } else {
+        await showModActions(chatId, msgId, env, userId, modGroupId);
+      }
+      return answerCb(cb.id, '', env);
+    }
+
+    if (action === 'mod_setmute') {
+      // param: <chatId>:<time>  禁言快捷时长
+      const ps = param.split(':');
+      const modGroupId = parseInt(ps[0]);
+      const muteArg = ps[1] || '';
+      if (!modGroupId) return answerCb(cb.id, '无效群', env);
+      await modAwaitTarget(chatId, msgId, userId, modGroupId, 'mute', muteArg, env);
+      return answerCb(cb.id, '', env);
+    }
+
+    if (action === 'mod_cancel') {
+      await env.LOTTERY_KV.delete(`mod_draft:${userId}`);
+      await editMsg(chatId, msgId, '❌ 已取消群管理操作', env);
+      return answerCb(cb.id, '已取消', env);
+    }
+
+    if (action === 'mod_back') {
+      const modGroupId = parseInt(param);
+      if (!modGroupId) return answerCb(cb.id, '无效群', env);
+      await env.LOTTERY_KV.delete(`mod_draft:${userId}`);
+      await showModActions(chatId, msgId, env, userId, modGroupId);
+      return answerCb(cb.id, '', env);
+    }
+
+    if (action === 'mod_back_list') {
+      await env.LOTTERY_KV.delete(`mod_draft:${userId}`);
+      await showModStart(chatId, msgId, env, userId);
+      return answerCb(cb.id, '', env);
     }
 
     // ============ 设置：选择群组 / 频道 / 时区 ============
@@ -1423,10 +1876,10 @@ async function handleCallbackQuery(cb, env) {
       const menuKb = [
         [{ text: '✨ 创建抽奖', callback_data: 'menu:create' }, { text: '📢 发布公告', callback_data: 'menu:announce' }],
         [{ text: '📊 发起投票', callback_data: 'menu:poll' }, { text: '📋 我的抽奖', callback_data: 'menu:list' }],
-        [{ text: '⚙️ 设置群组', callback_data: 'menu:groups' }, { text: '⚙️ 设置频道', callback_data: 'menu:channels' }],
-        [{ text: '🌏 设置时区', callback_data: 'menu:timezone' }],
+        [{ text: '🛡️ 群管理', callback_data: 'menu:mod' }, { text: '⚙️ 设置群组', callback_data: 'menu:groups' }],
+        [{ text: '⚙️ 设置频道', callback_data: 'menu:channels' }, { text: '🌏 设置时区', callback_data: 'menu:timezone' }],
       ];
-      await editMsg(chatId, msgId, '🎉 **群组管家 v6.6.1**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', env, menuKb);
+      await editMsg(chatId, msgId, '🎉 **群组管家 v6.7.1**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 🛡️ 群管理 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', env, menuKb);
       return answerCb(cb.id, '', env);
     }
 
