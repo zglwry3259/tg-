@@ -1221,7 +1221,7 @@ async function handleCallbackQuery(cb, env) {
     // ============ 设置：选择群组 / 频道 / 时区 ============
     if (action === 'set_group') {
       const groupId = parseInt(param);
-      await env.LOTTERY_KV.put(`user_cfg:${userId}`, JSON.stringify({ ...(await getUserCfg(userId, env)), defaultGroupId: groupId }), { expirationTtl: 0 });
+      await env.LOTTERY_KV.put(`user_cfg:${userId}`, JSON.stringify({ ...(await getUserCfg(userId, env)), defaultGroupId: groupId }));
       const groups = await getBotGroups(env);
       const g = groups.find(x => x.id === groupId);
       await editMsg(chatId, msgId, `✅ 默认发布群已设置为：\`${g?.title || groupId}\`\n\n以后创建抽奖/公告/投票会优先选中该群。`, env);
@@ -1230,7 +1230,7 @@ async function handleCallbackQuery(cb, env) {
 
     if (action === 'set_channel') {
       const channelId = parseInt(param);
-      await env.LOTTERY_KV.put(`user_cfg:${userId}`, JSON.stringify({ ...(await getUserCfg(userId, env)), defaultChannelId: channelId }), { expirationTtl: 0 });
+      await env.LOTTERY_KV.put(`user_cfg:${userId}`, JSON.stringify({ ...(await getUserCfg(userId, env)), defaultChannelId: channelId }));
       const channels = await getBotChannels(env);
       const c = channels.find(x => x.id === channelId);
       await editMsg(chatId, msgId, `✅ 默认发布频道已设置为：\`${c?.title || channelId}\``, env);
@@ -1240,7 +1240,7 @@ async function handleCallbackQuery(cb, env) {
     if (action === 'set_timezone') {
       const hours = parseInt(param);
       if (isNaN(hours)) return answerCb(cb.id, '无效时区', env);
-      await env.LOTTERY_KV.put('bot_timezone', String(hours), { expirationTtl: 0 });
+      await env.LOTTERY_KV.put('bot_timezone', String(hours));
       TZ_OFFSET_HOURS = hours;
       const names = { '8': '北京时间 (UTC+8)', '9': '东京时间 (UTC+9)', '0': 'UTC (UTC+0)', '7': '曼谷时间 (UTC+7)', '-5': '纽约时间 (UTC-5)' };
       await editMsg(chatId, msgId, `✅ 时区已设置为：**${names[hours] || `UTC${hours >= 0 ? '+' : ''}${hours}`}**\n\n所有开奖时间将按该时区显示。`, env);
