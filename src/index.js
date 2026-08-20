@@ -733,7 +733,7 @@ async function handleWizardStep(chatId, userId, text, env) {
             return sendMsgKb(chatId, '❌ 时间格式错误，请输入：\n`10分钟后` / `1小时后` / `1天后` / `1周后`\n或具体时间：`2026-08-25 20:00`', kb, env);
           }
           const [, y, m, d, h, min] = timeMatch;
-          targetTime = new Date(+y, +m - 1, +d, +h, +min, 0).getTime();
+          targetTime = parseBeijingTime(y, m, d, h, min);
         }
         if (targetTime <= Date.now()) {
           return sendMsgKb(chatId, '❌ 开奖时间必须在当前时间之后', kb, env);
@@ -1381,10 +1381,16 @@ function securePick(arr, count) {
   return shuffled.slice(0, count);
 }
 
+// 显示为北京时间（UTC+8）：Workers 默认 UTC，直接加 8 小时再取 UTC 字段
 function fmtDate(ts) {
-  const d = new Date(ts);
+  const d = new Date((ts || 0) + 8 * 60 * 60 * 1000);
   const pad = n => n.toString().padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+}
+
+// 把「北京时间」的年月日时分 转成 UTC 时间戳（输入按中国时区解析）
+function parseBeijingTime(y, m, d, h, min) {
+  return Date.UTC(+y, +m - 1, +d, +h - 8, +min, 0);
 }
 
 // 解析相对时间：10分钟后 / 1小时后 / 1天后 / 1周后（也支持不带“后”）
