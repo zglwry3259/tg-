@@ -18,7 +18,7 @@ const scopes = [
     // 不传 scope 即为 default：私聊时显示
     body: {
       commands: [
-        { command: 'create', description: '✨ 创建抽奖（8步向导）' },
+        { command: 'create', description: '✨ 创建抽奖（10步向导）' },
         { command: 'list', description: '📋 查看我创建的抽奖' },
         { command: 'draw', description: '🎲 手动开奖 用法: /draw <ID>' },
         { command: 'cancel', description: '❌ 取消抽奖 用法: /cancel <ID>' },

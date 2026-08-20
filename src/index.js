@@ -1,6 +1,6 @@
 /**
- * 群组管家 v6.3 - Cloudflare Workers
- * 抽奖模块（私聊创建+发布置顶+口令参与+定时/人数开奖+私信通知）
+ * 群组管家 v6.4 - Cloudflare Workers
+ * 抽奖模块（私聊创建+发布置顶+口令参与+定时/人数开奖+私信通知+中奖兑换码）
  * + 入群验证模块 + 管理员公告模块 + 投票模块
  */
 
@@ -52,7 +52,7 @@ async function ensureCommands(env) {
     const token = env.BOT_TOKEN || '';
     const url = `${TELEGRAM_API}/bot${token}/setMyCommands`;
     const privateCommands = [
-      { command: 'create', description: '✨ 创建抽奖（8步向导）' },
+      { command: 'create', description: '✨ 创建抽奖（10步向导）' },
       { command: 'announce', description: '📢 发布群公告（私聊发起）' },
       { command: 'poll', description: '📊 发起群投票（私聊发起）' },
       { command: 'list', description: '📋 查看我创建的抽奖' },
@@ -180,7 +180,7 @@ async function handleMessage(msg, env) {
         [{ text: '⚙️ 设置群组', callback_data: 'menu:groups' }, { text: '⚙️ 设置频道', callback_data: 'menu:channels' }],
         [{ text: '🌏 设置时区', callback_data: 'menu:timezone' }],
       ];
-      return sendMsgKb(chatId, '🎉 **群组管家 v6.3**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖 · 📢 发布公告（自动置顶）\n📊 发起投票 · 📋 我的抽奖\n⚙️ 设置默认群组 / 频道 · 🌏 时区', menuKb, env);
+      return sendMsgKb(chatId, '🎉 **群组管家 v6.4**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（可发兑换码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 📋 我的抽奖\n⚙️ 设置默认群组 / 频道 · 🌏 时区', menuKb, env);
     }
     if (cmdLower === '/create') {
       return startWizard(chatId, userId, username, chatTitle, env);
@@ -1004,12 +1004,12 @@ async function startWizard(chatId, userId, username, chatTitle, env) {
   const wizard = {
     userId,
     step: 1,
-    data: { name: '', prize: '', winnerCount: 1, keyword: '', triggerType: '', triggerValue: null, channel: '', groupId: null, groupName: '' },
+    data: { name: '', prize: '', winnerCount: 1, keyword: '', triggerType: '', triggerValue: null, channel: '', groupId: null, groupName: '', useCodes: false, codes: [] },
   };
   await env.LOTTERY_KV.put(`wizard:${userId}`, JSON.stringify(wizard), { expirationTtl: 3600 });
 
   const kb = [[{ text: '❌ 取消创建', callback_data: 'cancel_wizard' }]];
-  return sendMsgKb(chatId, `🎯 **抽奖创建向导**（第1步/共8步）\n\n📝 请输入**抽奖活动名称**：`, kb, env);
+  return sendMsgKb(chatId, `🎯 **抽奖创建向导**（第1步/共10步）\n\n📝 请输入**抽奖活动名称**：`, kb, env);
 }
 
 // 第7步：选择发布群（按钮）— 供「输入时间/人数」和「快捷时间按钮」复用
@@ -1040,13 +1040,27 @@ async function showWizardGroupPicker(chatId, userId, wizard, confirmText, env) {
   return sendMsgKb(chatId, `✅ ${confirmText}\n\n📢 第7步：请选择**公告发布群**（公告发到该群，参与也在此群）：`, groupKb, env);
 }
 
+// 第9步：兑换码开关（按钮）
+async function showCodeToggle(chatId, userId, wizard, env) {
+  const wizardKey = `wizard:${userId}`;
+  wizard.step = 9;
+  await env.LOTTERY_KV.put(wizardKey, JSON.stringify(wizard), { expirationTtl: 3600 });
+
+  const kb = [
+    [{ text: '✅ 是，填写兑换码', callback_data: 'code_mode:yes' },
+     { text: '🚫 否，不需要', callback_data: 'code_mode:no' }],
+    [{ text: '❌ 取消创建', callback_data: 'cancel_wizard' }],
+  ];
+  return sendMsgKb(chatId, `✅ 频道：${wizard.data.channel ? `\`${esc(wizard.data.channel)}\`` : '未设置（只发群）'}\n\n🎟️ 第9步：中奖后是否**直接通过 bot 发送兑换码**给中奖者？\n\n💡 选择「是」后，下一步请粘贴兑换码列表（每行一个），开奖时会按中奖名单逐个私信发放。`, kb, env);
+}
+
 async function handleWizardStep(chatId, userId, text, env) {
   const wizardKey = `wizard:${userId}`;
   const raw = await env.LOTTERY_KV.get(wizardKey);
   if (!raw) return;
 
   const wizard = JSON.parse(raw);
-  if (wizard.step < 1 || wizard.step > 8) return;
+  if (wizard.step < 1 || wizard.step > 10) return;
 
   const kb = [[{ text: '❌ 取消创建', callback_data: 'cancel_wizard' }]];
 
@@ -1162,7 +1176,22 @@ async function handleWizardStep(chatId, userId, text, env) {
       channelInput = channelInput.replace(/^https?:\/\/t\.me\//i, '');
       if (channelInput && !channelInput.startsWith('@')) channelInput = '@' + channelInput;
       wizard.data.channel = channelInput;
+      wizard.step = 9;
       await env.LOTTERY_KV.put(wizardKey, JSON.stringify(wizard), { expirationTtl: 3600 });
+      return showCodeToggle(chatId, userId, wizard, env);
+
+    case 10: // 兑换码列表（每行一个）
+      const codeLines = text.split('\n').map(s => s.replace(/[｜|,，、]/g, '\n').split('\n')).flat().map(s => s.trim()).filter(Boolean);
+      if (codeLines.length === 0) {
+        return sendMsgKb(chatId, '❌ 请输入至少一个兑换码（每行一个）：', kb, env);
+      }
+      wizard.data.useCodes = true;
+      wizard.data.codes = codeLines;
+      await env.LOTTERY_KV.put(wizardKey, JSON.stringify(wizard), { expirationTtl: 3600 });
+      if (codeLines.length < wizard.data.winnerCount) {
+        // 码少：警告但仍允许（开奖时未配发的会标注联系管理员）
+        await sendMessage(chatId, `⚠️ 兑换码数量（${codeLines.length}）少于中奖名额（${wizard.data.winnerCount}）\n开奖时未配发到码的中奖者将提示联系管理员。`, env);
+      }
       await finishWizard(chatId, null, userId, wizard, env);
       return;
 
@@ -1255,7 +1284,7 @@ async function handleCallbackQuery(cb, env) {
         [{ text: '⚙️ 设置群组', callback_data: 'menu:groups' }, { text: '⚙️ 设置频道', callback_data: 'menu:channels' }],
         [{ text: '🌏 设置时区', callback_data: 'menu:timezone' }],
       ];
-      await editMsg(chatId, msgId, '🎉 **群组管家 v6.3**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖 · 📢 发布公告（自动置顶）\n📊 发起投票 · 📋 我的抽奖\n⚙️ 设置默认群组 / 频道 · 🌏 时区', env, menuKb);
+      await editMsg(chatId, msgId, '🎉 **群组管家 v6.4**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（可发兑换码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 📋 我的抽奖\n⚙️ 设置默认群组 / 频道 · 🌏 时区', env, menuKb);
       return answerCb(cb.id, '', env);
     }
 
@@ -1326,10 +1355,31 @@ async function handleCallbackQuery(cb, env) {
       if (!raw) return answerCb(cb.id, '⏰ 会话已过期', env);
       const wizard = JSON.parse(raw);
       wizard.data.channel = '';
+      wizard.step = 9;
       await env.LOTTERY_KV.put(wizardKey, JSON.stringify(wizard), { expirationTtl: 3600 });
       await editMsg(chatId, msgId, '⏭️ 已跳过，只发布到群', env);
-      await finishWizard(chatId, msgId, userId, wizard, env);
+      await showCodeToggle(chatId, userId, wizard, env);
       return answerCb(cb.id, '✅ 跳过', env);
+    }
+
+    if (action === 'code_mode') {
+      const wizardKey = `wizard:${userId}`;
+      const raw = await env.LOTTERY_KV.get(wizardKey);
+      if (!raw) return answerCb(cb.id, '⏰ 会话已过期', env);
+      const wizard = JSON.parse(raw);
+      if (param === 'yes') {
+        wizard.step = 10;
+        await env.LOTTERY_KV.put(wizardKey, JSON.stringify(wizard), { expirationTtl: 3600 });
+        const kb = [[{ text: '❌ 取消创建', callback_data: 'cancel_wizard' }]];
+        await editMsg(chatId, msgId, '🎟️ **填写兑换码**（第10步/共10步）\n\n请粘贴**兑换码列表**，**每行一个**：\n\n💡 示例：\n`CODE-7X2K9M`\n`CODE-8PL4QN`\n`CODE-5RW3YT`\n\n📌 支持一行一个，或逗号/空格分隔；开奖时将按中奖名单顺序逐一私信发放。', env, kb);
+        return answerCb(cb.id, '📝 请发送兑换码', env);
+      }
+      // 否：不带兑换码
+      wizard.data.useCodes = false;
+      wizard.data.codes = [];
+      await env.LOTTERY_KV.put(wizardKey, JSON.stringify(wizard), { expirationTtl: 3600 });
+      await finishWizard(chatId, msgId, userId, wizard, env);
+      return answerCb(cb.id, '✅ 无需兑换码', env);
     }
 
     if (action === 'cancel_wizard') {
@@ -1445,6 +1495,9 @@ async function finishWizard(chatId, msgId, userId, wizard, env) {
     triggerType: wizard.data.triggerType,
     triggerValue: wizard.data.triggerValue,
     channel: wizard.data.channel || '',
+    useCodes: !!wizard.data.useCodes,
+    codes: Array.isArray(wizard.data.codes) ? wizard.data.codes : [],
+    codesUsed: [],
     participants: [],
     participantNames: {},
     winners: [],
@@ -1477,6 +1530,10 @@ async function finishWizard(chatId, msgId, userId, wizard, env) {
     ? `\n📢 频道：${lottery.channel}`
     : '';
 
+  const codeText = lottery.useCodes
+    ? `\n🎟️ 中奖后由 bot 私信发放兑换码`
+    : '';
+
   // 发布到群
   const groupPost = `🎊 **抽奖开始啦！** 🎊
 
@@ -1484,7 +1541,7 @@ async function finishWizard(chatId, msgId, userId, wizard, env) {
 📝 **活动名称：** ${esc(lottery.name)}
 🎁 **奖品：** ${esc(lottery.prize)}
 🏆 **中奖名额：** ${lottery.winnerCount} 人
-${triggerText}${channelText}
+${triggerText}${channelText}${codeText}
 ━━━━━━━━━━━━━━━━
 
 🔑 在群内发送口令 \`${lottery.keyword}\` 即可参与抽奖！`;
@@ -1534,6 +1591,7 @@ ${triggerText}${channelText}
 📢 **发布群：** \`${lottery.groupId}\`${lottery.groupName ? `（${esc(lottery.groupName)}）` : ''}
 ${lottery.channel ? `📢 **频道：** ${lottery.channel}` : ''}
 🔑 **口令：** \`${lottery.keyword}\`
+${lottery.useCodes ? `🎟️ **兑换码：** ${lottery.codes.length} 个（开奖时自动私信中奖者）` : ''}
 ${botWarn}
 💡 查看抽奖：\`/list\` · 手动开奖：\`/draw ${lottery.id}\` · 取消：\`/cancel ${lottery.id}\``;
 
@@ -1692,14 +1750,28 @@ ${winnerList}
 
   // 私信通知中奖者（检测失败，不静默）
   const dmFailed = [];
+  let codeIdx = 0;
+  const codeAssignments = {}; // winnerId -> code
   for (const winnerId of winners) {
     const name = lottery.participantNames[winnerId] || `用户${winnerId}`;
+    let codeText = '';
+    if (lottery.useCodes && Array.isArray(lottery.codes)) {
+      if (codeIdx < lottery.codes.length) {
+        const code = lottery.codes[codeIdx];
+        codeIdx++;
+        codeAssignments[winnerId] = code;
+        codeText = `\n🎟️ **兑换码：** \`${esc(code)}\``;
+        lottery.codesUsed.push(code);
+      } else {
+        codeText = '\n⚠️ 兑换码已发放完毕，请联系管理员单独处理';
+      }
+    }
     const dmText = `🥳🥳 **恭喜中奖啦！** 🥳🥳
 
 ━━━━━━━━━━━━━━━━
 **抽奖群：** ${esc(chatTitle || lottery.groupName)}
 **活动名称：** ${esc(lottery.name)}
-**获得奖品：** ${esc(lottery.prize)}
+**获得奖品：** ${esc(lottery.prize)}${codeText}
 ━━━━━━━━━━━━━━━━
 
 『联系该群管理领取您的奖品吧~』
@@ -1711,6 +1783,11 @@ ${winnerList}
     }
   }
 
+  // 若有发放兑换码，持久化已使用列表
+  if (lottery.useCodes && codeIdx > 0) {
+    await env.LOTTERY_KV.put(`lottery:${lotteryId}`, JSON.stringify(lottery));
+  }
+
   // 私信失败的：在群里补一条提示（中奖者需先私聊机器人才能收到通知）
   if (dmFailed.length > 0) {
     const failedNames = dmFailed.map(id => lottery.participantNames[id] || `用户${id}`);
@@ -1720,7 +1797,11 @@ ${winnerList}
   }
 
   // 通知创建者
-  const creatorList = winnerNames.map((n, i) => `${i + 1}- ${n}  获得:${esc(lottery.prize)}`).join('\n');
+  const winnerIds = winners;
+  const creatorList = winnerNames.map((n, i) => {
+    const code = codeAssignments[winnerIds[i]];
+    return `${i + 1}- ${n}  获得:${esc(lottery.prize)}${code ? `\n    🎟️ 兑换码: \`${esc(code)}\`` : ''}`;
+  }).join('\n');
   const creatorText = `💐💐💐 **开奖了** 💐💐💐
 
 **${esc(lottery.name)}** 开奖了!
