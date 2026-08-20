@@ -1,5 +1,5 @@
 /**
- * 群组管家 v6.6 - Cloudflare Workers
+ * 群组管家 v6.6.1 - Cloudflare Workers
  * 抽奖模块（私聊创建+多奖品+发布置顶+口令参与+定时/人数开奖+私信通知+中奖兑奖）
  * + 入群验证模块 + 管理员公告模块 + 投票模块
  */
@@ -186,7 +186,7 @@ async function handleMessage(msg, env) {
         [{ text: '⚙️ 设置群组', callback_data: 'menu:groups' }, { text: '⚙️ 设置频道', callback_data: 'menu:channels' }],
         [{ text: '🌏 设置时区', callback_data: 'menu:timezone' }],
       ];
-      return sendMsgKb(chatId, '🎉 **群组管家 v6.6**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', menuKb, env);
+      return sendMsgKb(chatId, '🎉 **群组管家 v6.6.1**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', menuKb, env);
     }
     if (cmdLower === '/create') {
       return startWizard(chatId, userId, username, chatTitle, env);
@@ -368,9 +368,12 @@ async function handleChatMember(mcm, env) {
 
   const oldStatus = mcm.old_chat_member?.status || '';
   const newStatus = newMember.status || '';
+  console.log(`[chat_member] user=${userId} old=${JSON.stringify(oldStatus)} new=${JSON.stringify(newStatus)} chat=${chat.id}`);
 
-  // 只处理真正的成员加入（left/kicked → member），避免解除禁言(restricted→member)等误判
-  if (oldStatus !== 'left' && oldStatus !== 'kicked') return;
+  // 只处理真正的成员加入：
+  //   old 为 left / kicked / 空(Telegram 踢出后重加时常缺失旧状态) → new 为 member / restricted
+  //   避免解除禁言(restricted→member)、改权限等误判
+  if (oldStatus !== '' && oldStatus !== 'left' && oldStatus !== 'kicked') return;
   if (newStatus !== 'member' && newStatus !== 'restricted') return;
 
   // 读取该群验证开关（默认开启）
@@ -1423,7 +1426,7 @@ async function handleCallbackQuery(cb, env) {
         [{ text: '⚙️ 设置群组', callback_data: 'menu:groups' }, { text: '⚙️ 设置频道', callback_data: 'menu:channels' }],
         [{ text: '🌏 设置时区', callback_data: 'menu:timezone' }],
       ];
-      await editMsg(chatId, msgId, '🎉 **群组管家 v6.6**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', env, menuKb);
+      await editMsg(chatId, msgId, '🎉 **群组管家 v6.6.1**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', env, menuKb);
       return answerCb(cb.id, '', env);
     }
 
