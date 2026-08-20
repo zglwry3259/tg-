@@ -33,6 +33,7 @@ export default {
 
   // 每分钟触发：定时开奖检查
   async scheduled(event, env, ctx) {
+    await loadTzOffset(env);
     ctx.waitUntil(checkScheduledDraws(env));
     ctx.waitUntil(checkPendingVerifications(env));
     // 首次自动设置指令菜单（只需一次）
@@ -141,6 +142,7 @@ async function removeFromScheduled(env, lotteryId) {
 // ==================== 路由 ====================
 
 async function handleUpdate(update, env) {
+  await loadTzOffset(env);
   if (update.message) await handleMessage(update.message, env);
   else if (update.callback_query) await handleCallbackQuery(update.callback_query, env);
   else if (update.my_chat_member) await handleMyChatMember(update.my_chat_member, env);
@@ -164,7 +166,13 @@ async function handleMessage(msg, env) {
       if (deepLink === 'notify' || deepLink === '开启提醒') {
         return sendMessage(chatId, '🔔 **中奖私信提醒已开启！**\n\n以后你参与的抽奖开奖后，中奖结果会第一时间私信通知你～\n（本提示仅需开启一次，之后所有抽奖自动生效）', env);
       }
-      return sendMessage(chatId, '🎉 **群组管家 v6.1**\n\n📌 所有功能都在**私聊**向我发起，发布到你选择的群：\n\n✨ `/create` 创建抽奖（向导）\n📢 `/announce` 发布群公告（自动置顶）\n📊 `/poll` 发起群投票\n\n📋 `/list` 我创建的抽奖\n🎲 `/draw ID` 手动开奖 · ❌ `/cancel ID` 取消\n🤖 `/groups` 查看我已加入的群\n\n💡 输入 `/announce` 或 `/poll` 后，按提示发送内容即可', env);
+      const menuKb = [
+        [{ text: '✨ 创建抽奖', callback_data: 'menu:create' }, { text: '📢 发布公告', callback_data: 'menu:announce' }],
+        [{ text: '📊 发起投票', callback_data: 'menu:poll' }, { text: '📋 我的抽奖', callback_data: 'menu:list' }],
+        [{ text: '⚙️ 设置群组', callback_data: 'menu:groups' }, { text: '⚙️ 设置频道', callback_data: 'menu:channels' }],
+        [{ text: '🌏 设置时区', callback_data: 'menu:timezone' }],
+      ];
+      return sendMsgKb(chatId, '🎉 **群组管家 v6.2**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖 · 📢 发布公告（自动置顶）\n📊 发起投票 · 📋 我的抽奖\n⚙️ 设置默认群组 / 频道 · 🌏 时区', menuKb, env);
     }
     if (cmdLower === '/create') {
       return startWizard(chatId, userId, username, chatTitle, env);
@@ -226,27 +234,30 @@ async function handleMessage(msg, env) {
   }
 }
 
-// ==================== Bot 入群记录（发布目标群列表） ====================
+// ==================== Bot 入群记录（发布目标群/频道列表） ====================
 
 async function handleMyChatMember(mcm, env) {
   const chat = mcm.chat;
-  if (!chat || (chat.type !== 'group' && chat.type !== 'supergroup')) return;
+  if (!chat) return;
+  const isChannel = chat.type === 'channel';
+  const isGroup = chat.type === 'group' || chat.type === 'supergroup';
+  if (!isGroup && !isChannel) return;
   const newStatus = mcm.new_chat_member?.status || '';
 
-  const key = 'bot_groups';
+  const key = isChannel ? 'bot_channels' : 'bot_groups';
   const raw = await env.LOTTERY_KV.get(key);
-  let groups = raw ? JSON.parse(raw) : [];
-  if (!Array.isArray(groups)) groups = [];
+  let list = raw ? JSON.parse(raw) : [];
+  if (!Array.isArray(list)) list = [];
 
-  const idx = groups.findIndex(g => g.id === chat.id);
+  const idx = list.findIndex(g => g.id === chat.id);
   if (newStatus === 'left' || newStatus === 'kicked') {
-    if (idx >= 0) groups.splice(idx, 1);
+    if (idx >= 0) list.splice(idx, 1);
   } else if (newStatus === 'member' || newStatus === 'administrator' || newStatus === 'restricted') {
-    const g = { id: chat.id, title: chat.title || `群${chat.id}` };
-    if (idx >= 0) groups[idx] = g;
-    else groups.push(g);
+    const g = { id: chat.id, title: chat.title || (isChannel ? `频道${chat.id}` : `群${chat.id}`) };
+    if (idx >= 0) list[idx] = g;
+    else list.push(g);
   }
-  await env.LOTTERY_KV.put(key, JSON.stringify(groups));
+  await env.LOTTERY_KV.put(key, JSON.stringify(list));
 }
 
 async function getBotGroups(env) {
@@ -254,6 +265,69 @@ async function getBotGroups(env) {
   if (!raw) return [];
   const groups = JSON.parse(raw);
   return Array.isArray(groups) ? groups : [];
+}
+
+async function getBotChannels(env) {
+  const raw = await env.LOTTERY_KV.get('bot_channels');
+  if (!raw) return [];
+  const channels = JSON.parse(raw);
+  return Array.isArray(channels) ? channels : [];
+}
+
+// 用户设置（默认群/默认频道）
+async function getUserCfg(userId, env) {
+  const raw = await env.LOTTERY_KV.get(`user_cfg:${userId}`);
+  if (!raw) return { defaultGroupId: null, defaultChannelId: null };
+  try { return JSON.parse(raw); } catch { return { defaultGroupId: null, defaultChannelId: null }; }
+}
+
+// 设置页：选择默认群组
+async function showSettingsGroups(chatId, msgId, env, userId) {
+  const groups = await getBotGroups(env);
+  const cfg = await getUserCfg(userId, env);
+  const kb = [];
+  for (const g of groups.slice(0, 15)) {
+    const mark = cfg.defaultGroupId === g.id ? ' ⭐' : '';
+    kb.push([{ text: `📢 ${esc(g.title || g.id)}${mark}`, callback_data: `set_group:${g.id}` }]);
+  }
+  kb.push([{ text: '🔙 返回主菜单', callback_data: 'menu_back' }]);
+  if (groups.length === 0) {
+    await editMsg(chatId, msgId, '⚠️ **还未找到可发布群组**\n\n请先把机器人**加入目标群组**（并设为管理员），bot 会自动记录。', env, kb);
+    return;
+  }
+  await editMsg(chatId, msgId, `⚙️ **设置默认发布群组**\n\n点击选择一个群组作为默认发布目标（⭐ 为当前默认）：`, env, kb);
+}
+
+// 设置页：选择默认频道
+async function showSettingsChannels(chatId, msgId, env, userId) {
+  const channels = await getBotChannels(env);
+  const cfg = await getUserCfg(userId, env);
+  const kb = [];
+  for (const c of channels.slice(0, 15)) {
+    const mark = cfg.defaultChannelId === c.id ? ' ⭐' : '';
+    kb.push([{ text: `📣 ${esc(c.title || c.id)}${mark}`, callback_data: `set_channel:${c.id}` }]);
+  }
+  kb.push([{ text: '🔙 返回主菜单', callback_data: 'menu_back' }]);
+  if (channels.length === 0) {
+    await editMsg(chatId, msgId, '⚠️ **还未找到频道**\n\n请先把机器人**加入目标频道**（并设为管理员），bot 会自动记录。', env, kb);
+    return;
+  }
+  await editMsg(chatId, msgId, `⚙️ **设置默认发布频道**\n\n点击选择一个频道作为默认发布目标（⭐ 为当前默认）：`, env, kb);
+}
+
+// 设置页：选择时区
+async function showSettingsTimezone(chatId, msgId, env, userId) {
+  const names = [
+    { label: '🇨🇳 北京时间 (UTC+8)', val: '8' },
+    { label: '🇯🇵 东京时间 (UTC+9)', val: '9' },
+    { label: '🇹🇭 曼谷时间 (UTC+7)', val: '7' },
+    { label: '🌐 UTC (UTC+0)', val: '0' },
+    { label: '🇺🇸 纽约时间 (UTC-5)', val: '-5' },
+  ];
+  const kb = names.map(n => [{ text: n.label, callback_data: `set_timezone:${n.val}` }]);
+  kb.push([{ text: '🔙 返回主菜单', callback_data: 'menu_back' }]);
+  const tzNames = { 8: '北京时间', 9: '东京时间', 0: 'UTC', 7: '曼谷时间', '-5': '纽约时间' };
+  await editMsg(chatId, msgId, `🌏 **设置时区**\n\n当前时区：**${tzNames[TZ_OFFSET_HOURS] || `UTC${TZ_OFFSET_HOURS >= 0 ? '+' : ''}${TZ_OFFSET_HOURS}`}**\n\n开奖时间会按所选时区显示：`, env, kb);
 }
 
 // ==================== 入群验证 ====================
@@ -527,9 +601,19 @@ async function publishPoll(chatId, userId, targetGroupId, msgId, env) {
 // 展示可发布群列表（按钮）供用户选择；无群时提示手动输入
 async function showGroupPicker(chatId, env, actionPrefix) {
   const groups = await getBotGroups(env);
+  const cfg = await getUserCfg(chatId, env);
+  // 默认群排最前并标注 ⭐
+  if (cfg.defaultGroupId) {
+    const idx = groups.findIndex(g => g.id === cfg.defaultGroupId);
+    if (idx > 0) {
+      const [def] = groups.splice(idx, 1);
+      groups.unshift(def);
+    }
+  }
   const kb = [];
   for (const g of groups.slice(0, 12)) {
-    kb.push([{ text: `📢 ${esc(g.title || g.id)}`, callback_data: `${actionPrefix}:${g.id}` }]);
+    const isDef = cfg.defaultGroupId === g.id;
+    kb.push([{ text: `${isDef ? '⭐ ' : ''}📢 ${esc(g.title || g.id)}`, callback_data: `${actionPrefix}:${g.id}` }]);
   }
   kb.push([{ text: '❌ 取消', callback_data: 'cancel_group_pick' }]);
   return sendMsgKb(chatId, `📤 **选择发布群**\n\n点选下方群组（最多显示12个），或直接输入群 ID / t.me 链接：`, kb, env);
@@ -669,9 +753,18 @@ async function showWizardGroupPicker(chatId, userId, wizard, confirmText, env) {
   if (groups.length === 0) {
     return sendMsgKb(chatId, `⚠️ **还未找到可发布群**\n\n请先把机器人**加入目标群组**（并设为管理员），然后发送 \`/groups\` 刷新，或直接输入群 ID（如 \`-1001234567890\`）。`, kb, env);
   }
+  const cfg = await getUserCfg(userId, env);
+  if (cfg.defaultGroupId) {
+    const idx = groups.findIndex(g => g.id === cfg.defaultGroupId);
+    if (idx > 0) {
+      const [def] = groups.splice(idx, 1);
+      groups.unshift(def);
+    }
+  }
   const groupKb = [];
   for (const g of groups.slice(0, 12)) {
-    groupKb.push([{ text: `📢 ${esc(g.title || g.id)}`, callback_data: `select_group:${g.id}` }]);
+    const isDef = cfg.defaultGroupId === g.id;
+    groupKb.push([{ text: `${isDef ? '⭐ ' : ''}📢 ${esc(g.title || g.id)}`, callback_data: `select_group:${g.id}` }]);
   }
   groupKb.push([{ text: '❌ 取消创建', callback_data: 'cancel_wizard' }]);
   return sendMsgKb(chatId, `✅ ${confirmText}\n\n📢 第7步：请选择**公告发布群**（公告发到该群，参与也在此群）：`, groupKb, env);
@@ -733,7 +826,7 @@ async function handleWizardStep(chatId, userId, text, env) {
             return sendMsgKb(chatId, '❌ 时间格式错误，请输入：\n`10分钟后` / `1小时后` / `1天后` / `1周后`\n或具体时间：`2026-08-25 20:00`', kb, env);
           }
           const [, y, m, d, h, min] = timeMatch;
-          targetTime = parseBeijingTime(y, m, d, h, min);
+          targetTime = parseLocalTime(y, m, d, h, min);
         }
         if (targetTime <= Date.now()) {
           return sendMsgKb(chatId, '❌ 开奖时间必须在当前时间之后', kb, env);
@@ -819,6 +912,83 @@ async function handleCallbackQuery(cb, env) {
   const param = params.join(':');
 
   try {
+    // ============ 主菜单（/start 内联键盘） ============
+    if (action === 'menu') {
+      if (param === 'create') {
+        await startWizard(chatId, userId, '', '', env);
+        return answerCb(cb.id, '', env);
+      }
+      if (param === 'announce') {
+        await env.LOTTERY_KV.put(`announce_pending:${userId}`, '1', { expirationTtl: 900 });
+        const kb = [[{ text: '❌ 取消', callback_data: 'cancel_announce_pending' }]];
+        await editMsg(chatId, msgId, '📢 **管理员公告**\n\n请直接发送**公告内容**：\n\n💡 示例：`本周六晚8点群活动，欢迎参加！`', env, kb);
+        return answerCb(cb.id, '', env);
+      }
+      if (param === 'poll') {
+        await env.LOTTERY_KV.put(`poll_pending:${chatId}`, '1', { expirationTtl: 900 });
+        const kb = [[{ text: '❌ 取消', callback_data: 'cancel_poll_pending' }]];
+        await editMsg(chatId, msgId, '📊 **发起投票**\n\n请直接发送：`问题|选项1|选项2|...`\n\n💡 示例：`今晚吃什么？|火锅|烧烤|日料`\n⚡ 多选：`--multi 喜欢哪些？|A|B|C`', env, kb);
+        return answerCb(cb.id, '', env);
+      }
+      if (param === 'list') {
+        await listLotteries(chatId, env, '', userId);
+        return answerCb(cb.id, '', env);
+      }
+      if (param === 'groups') {
+        await showSettingsGroups(chatId, msgId, env, userId);
+        return answerCb(cb.id, '', env);
+      }
+      if (param === 'channels') {
+        await showSettingsChannels(chatId, msgId, env, userId);
+        return answerCb(cb.id, '', env);
+      }
+      if (param === 'timezone') {
+        await showSettingsTimezone(chatId, msgId, env, userId);
+        return answerCb(cb.id, '', env);
+      }
+    }
+
+    // ============ 设置：选择群组 / 频道 / 时区 ============
+    if (action === 'set_group') {
+      const groupId = parseInt(param);
+      await env.LOTTERY_KV.put(`user_cfg:${userId}`, JSON.stringify({ ...(await getUserCfg(userId, env)), defaultGroupId: groupId }), { expirationTtl: 0 });
+      const groups = await getBotGroups(env);
+      const g = groups.find(x => x.id === groupId);
+      await editMsg(chatId, msgId, `✅ 默认发布群已设置为：\`${g?.title || groupId}\`\n\n以后创建抽奖/公告/投票会优先选中该群。`, env);
+      return answerCb(cb.id, '✅ 已设置', env);
+    }
+
+    if (action === 'set_channel') {
+      const channelId = parseInt(param);
+      await env.LOTTERY_KV.put(`user_cfg:${userId}`, JSON.stringify({ ...(await getUserCfg(userId, env)), defaultChannelId: channelId }), { expirationTtl: 0 });
+      const channels = await getBotChannels(env);
+      const c = channels.find(x => x.id === channelId);
+      await editMsg(chatId, msgId, `✅ 默认发布频道已设置为：\`${c?.title || channelId}\``, env);
+      return answerCb(cb.id, '✅ 已设置', env);
+    }
+
+    if (action === 'set_timezone') {
+      const hours = parseInt(param);
+      if (isNaN(hours)) return answerCb(cb.id, '无效时区', env);
+      await env.LOTTERY_KV.put('bot_timezone', String(hours), { expirationTtl: 0 });
+      TZ_OFFSET_HOURS = hours;
+      const names = { '8': '北京时间 (UTC+8)', '9': '东京时间 (UTC+9)', '0': 'UTC (UTC+0)', '7': '曼谷时间 (UTC+7)', '-5': '纽约时间 (UTC-5)' };
+      await editMsg(chatId, msgId, `✅ 时区已设置为：**${names[hours] || `UTC${hours >= 0 ? '+' : ''}${hours}`}**\n\n所有开奖时间将按该时区显示。`, env);
+      return answerCb(cb.id, '✅ 已设置', env);
+    }
+
+    // ============ 主菜单：返回 ============
+    if (action === 'menu_back') {
+      const menuKb = [
+        [{ text: '✨ 创建抽奖', callback_data: 'menu:create' }, { text: '📢 发布公告', callback_data: 'menu:announce' }],
+        [{ text: '📊 发起投票', callback_data: 'menu:poll' }, { text: '📋 我的抽奖', callback_data: 'menu:list' }],
+        [{ text: '⚙️ 设置群组', callback_data: 'menu:groups' }, { text: '⚙️ 设置频道', callback_data: 'menu:channels' }],
+        [{ text: '🌏 设置时区', callback_data: 'menu:timezone' }],
+      ];
+      await editMsg(chatId, msgId, '🎉 **群组管家 v6.2**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖 · 📢 发布公告（自动置顶）\n📊 发起投票 · 📋 我的抽奖\n⚙️ 设置默认群组 / 频道 · 🌏 时区', env, menuKb);
+      return answerCb(cb.id, '', env);
+    }
+
     if (action === 'trigger_type') {
       const wizardKey = `wizard:${userId}`;
       const raw = await env.LOTTERY_KV.get(wizardKey);
@@ -1381,16 +1551,31 @@ function securePick(arr, count) {
   return shuffled.slice(0, count);
 }
 
-// 显示为北京时间（UTC+8）：Workers 默认 UTC，直接加 8 小时再取 UTC 字段
+// 时区配置：KV 存 offset 小时（默认 +8 北京时间）
+// bot_timezone 为整数小时偏移，如 8 / 9 / 0
+let TZ_OFFSET_HOURS = 8;
+
+async function loadTzOffset(env) {
+  try {
+    const raw = await env.LOTTERY_KV.get('bot_timezone');
+    if (!raw) { TZ_OFFSET_HOURS = 8; return; }
+    const parsed = parseInt(raw);
+    TZ_OFFSET_HOURS = isNaN(parsed) ? 8 : parsed;
+  } catch {
+    TZ_OFFSET_HOURS = 8;
+  }
+}
+
+// 显示为当前时区时间：Workers 默认 UTC，按 TZ_OFFSET_HOURS 偏移后取 UTC 字段
 function fmtDate(ts) {
-  const d = new Date((ts || 0) + 8 * 60 * 60 * 1000);
+  const d = new Date((ts || 0) + TZ_OFFSET_HOURS * 60 * 60 * 1000);
   const pad = n => n.toString().padStart(2, '0');
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
 }
 
-// 把「北京时间」的年月日时分 转成 UTC 时间戳（输入按中国时区解析）
-function parseBeijingTime(y, m, d, h, min) {
-  return Date.UTC(+y, +m - 1, +d, +h - 8, +min, 0);
+// 把「当前时区」的年月日时分 转成 UTC 时间戳（输入按当前时区解析）
+function parseLocalTime(y, m, d, h, min) {
+  return Date.UTC(+y, +m - 1, +d, +h - TZ_OFFSET_HOURS, +min, 0);
 }
 
 // 解析相对时间：10分钟后 / 1小时后 / 1天后 / 1周后（也支持不带“后”）
