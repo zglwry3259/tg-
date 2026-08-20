@@ -1,6 +1,6 @@
 {
   "name": "tg-group-bot",
-  "version": "6.7.2",
+  "version": "6.7.3",
   "description": "群组管家 v6.7.1 - 抽奖(多奖品+兑奖)+加减法入群验证+管理员公告+投票+群管工具",
   "main": "src/index.js",
   "type": "module",
