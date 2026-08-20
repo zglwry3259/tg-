@@ -186,7 +186,7 @@ async function handleMessage(msg, env) {
         [{ text: '🛡️ 群管理', callback_data: 'menu:mod' }, { text: '⚙️ 设置群组', callback_data: 'menu:groups' }],
         [{ text: '⚙️ 设置频道', callback_data: 'menu:channels' }, { text: '🌏 设置时区', callback_data: 'menu:timezone' }],
       ];
-      return sendMsgKb(chatId, '🎉 **群组管家 v6.7.3**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 🛡️ 群管理 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', menuKb, env);
+      return sendMsgKb(chatId, '🎉 **群组管家 v6.7.4**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 🛡️ 群管理 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', menuKb, env);
     }
     if (cmdLower === '/create') {
       return startWizard(chatId, userId, username, chatTitle, env);
@@ -384,13 +384,38 @@ async function handleChatMember(mcm, env) {
 
   const oldStatus = mcm.old_chat_member?.status || '';
   const newStatus = newMember.status || '';
+  const userName = newMember.user?.username || newMember.user?.first_name || `用户${userId}`;
   console.log(`[chat_member] user=${userId} old=${JSON.stringify(oldStatus)} new=${JSON.stringify(newStatus)} chat=${chat.id}`);
+
+  // KV 调试日志：记录最近 5 条 chat_member 事件
+  try {
+    const logRaw = await env.LOTTERY_KV.get('debug:chat_member_events');
+    let logs = [];
+    if (logRaw) { try { logs = JSON.parse(logRaw); } catch {} }
+    logs.unshift({
+      t: Date.now(),
+      chat: chat.id,
+      user: userId,
+      name: userName,
+      old: oldStatus,
+      new: newStatus,
+      processed: null, // 后面填
+    });
+    if (logs.length > 5) logs.length = 5;
+    await env.LOTTERY_KV.put('debug:chat_member_events', JSON.stringify(logs));
+  } catch {}
 
   // 只处理真正的成员加入：
   //   old 为 left / kicked / 空(Telegram 踢出后重加时常缺失旧状态) → new 为 member / restricted
   //   避免解除禁言(restricted→member)、改权限等误判
-  if (oldStatus !== '' && oldStatus !== 'left' && oldStatus !== 'kicked') return;
-  if (newStatus !== 'member' && newStatus !== 'restricted') return;
+  if (oldStatus !== '' && oldStatus !== 'left' && oldStatus !== 'kicked') {
+    await updateDebugLogResult(env, `skip_old=${oldStatus}`);
+    return;
+  }
+  if (newStatus !== 'member' && newStatus !== 'restricted') {
+    await updateDebugLogResult(env, `skip_new=${newStatus}`);
+    return;
+  }
 
   // 读取该群验证开关（默认开启）
   const cfgRaw = await env.LOTTERY_KV.get(`verify_cfg:${chat.id}`);
@@ -401,6 +426,7 @@ async function handleChatMember(mcm, env) {
   if (!cfg.enabled) {
     // 验证关闭：直接发自定义欢迎语（若设置了）
     await sendWelcomeIfSet(chat.id, newMember.user.username || newMember.user.first_name || `用户${userId}`, env);
+    await updateDebugLogResult(env, 'verify_disabled');
     return;
   }
 
@@ -450,6 +476,21 @@ async function handleChatMember(mcm, env) {
     pending.msgId = res.result.message_id;
     await env.LOTTERY_KV.put(vKey, JSON.stringify(pending), { expirationTtl: 660 });
   }
+  // 更新调试日志：验证消息已发送
+  await updateDebugLogResult(env, 'sent_verify_msg');
+}
+
+// 更新 chat_member 调试日志的最新的 processed 值
+async function updateDebugLogResult(env, result) {
+  try {
+    const logRaw = await env.LOTTERY_KV.get('debug:chat_member_events');
+    if (!logRaw) return;
+    const logs = JSON.parse(logRaw);
+    if (logs.length > 0) {
+      logs[0].processed = result;
+      await env.LOTTERY_KV.put('debug:chat_member_events', JSON.stringify(logs));
+    }
+  } catch {}
 }
 
 // 每分钟检查：超时未验证的成员，移出群聊
@@ -935,6 +976,22 @@ async function diagCmd(chatId, userId, env) {
         let enabled = true;
         if (raw) { try { enabled = JSON.parse(raw).enabled; } catch {} }
         lines.push(`- ${esc(g.title || `群 ${g.id}`)}：${enabled ? '开启 ✅' : '关闭 ❌'}`);
+      }
+    }
+  } catch {}
+
+  // 4. chat_member 事件调试日志
+  try {
+    const logRaw = await env.LOTTERY_KV.get('debug:chat_member_events');
+    if (logRaw) {
+      const logs = JSON.parse(logRaw);
+      if (logs.length > 0) {
+        lines.push('\n📋 **最近 chat_member 事件**：');
+        for (const e of logs) {
+          const dt = new Date(e.t).toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' });
+          const res = e.processed || 'pending';
+          lines.push(`- \`${dt}\` 群${e.chat} 用户${e.user}(${e.name}) ${e.old}→${e.new} → ${res}`);
+        }
       }
     }
   } catch {}
@@ -1879,7 +1936,7 @@ async function handleCallbackQuery(cb, env) {
         [{ text: '🛡️ 群管理', callback_data: 'menu:mod' }, { text: '⚙️ 设置群组', callback_data: 'menu:groups' }],
         [{ text: '⚙️ 设置频道', callback_data: 'menu:channels' }, { text: '🌏 设置时区', callback_data: 'menu:timezone' }],
       ];
-      await editMsg(chatId, msgId, '🎉 **群组管家 v6.7.3**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 🛡️ 群管理 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', env, menuKb);
+      await editMsg(chatId, msgId, '🎉 **群组管家 v6.7.4**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 🛡️ 群管理 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', env, menuKb);
       return answerCb(cb.id, '', env);
     }
 
