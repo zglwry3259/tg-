@@ -1,97 +1,82 @@
-# 🎉 Telegram 抽奖机器人 v3.0 (Cloudflare Workers)
+# Telegram 抽奖机器人 v4.1（Cloudflare Workers）
 
-一个轻量级、无服务器的 Telegram 抽奖机器人，部署在 **Cloudflare Workers** 上，使用 **KV** 存储数据。
+群组抽奖机器人：**私聊创建**，公告自动发布到你选择的**群聊**（和可选**频道**），
+群内发口令参与，定时/人数自动开奖，开奖后私信通知中奖者、给创建者发中奖名单。
 
----
+## 功能
 
-## ✨ v3.0 优化亮点
+- 📝 **私聊创建向导**（共 8 步）：活动名称 → 奖品 → 中奖名额 → 口令 → 开奖方式 → 开奖条件 → 选择发布群 → 频道(可选)
+- 📢 **发布到群 + 频道**：创建完成后公告自动发到选定群；可另选频道同步发布（并可强制加频道）
+- 🔑 **口令参与**：参与者在群内发送口令即参与
+- ⏰ **定时开奖**（Cron 每分钟检查）/ 👥 **人数开奖**（满员自动开）
+- 📣 **强制加频道**：可要求先加入指定频道才能参与
+- 🥳 **开奖通知**：群内公告 + 私信中奖者 + 私信创建者中奖名单
+- 📋 **管理**：`/list` 查看、`/draw <ID>` 手动开奖、`/cancel <ID>` 取消、`/groups` 查看 bot 已加入的群
 
-| # | 优化项 | 说明 |
-|---|--------|------|
-| 1 | **幂等处理** | 记录 `update_id`，防止 Telegram 重放 |
-| 2 | **乐观锁防并发** | KV 写入带 `version`，高并发参与自动重试 |
-| 3 | **加密安全随机** | `crypto.getRandomValues` + Fisher-Yates |
-| 4 | **KV 读写优化** | `Set` O(1) 查询；用户名缓存 |
-| 5 | **Webhook 签名验证** | HMAC-SHA256 |
-| 6 | **API 重试 + 限流** | 429 退避 + 网络错误指数退避 |
-| 7 | **消息编辑** | 参与成功编辑原消息，减少刷屏 |
-| 8 | **`/my` 补全** | 我参与/创建的抽奖 |
-| 9 | **列表排序** | 进行中优先 + 时间倒序 |
+## 部署
 
----
+### 1. 准备工作
 
-## 🚀 一键部署（3 步）
+1. `@BotFather` 创建机器人，拿到 `BOT_TOKEN`
+2. 把机器人加到你想要发布抽奖的群组，并设为**管理员**
+3. 把机器人加为频道**管理员**（若要发布到频道/强制加频道）
+4. Cloudflare 创建 KV Namespace，记录 Namespace ID
 
-KV 命名空间由 GitHub Actions **自动创建**。
+### 2. 配置 wrangler.toml
 
-### Step 1 — 配置 3 个 GitHub Secrets
+把 KV ID 填入：
 
-GitHub → 仓库 → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
-
-| Secret | 必填 | 在哪拿 |
-|--------|------|--------|
-| `CF_API_TOKEN` | ✅ | Cloudflare → Workers & Pages → API Tokens → **Create Token**（权限：Workers **Edit** + KV **Edit**） |
-| `CF_ACCOUNT_ID` | ✅ | Cloudflare Dashboard 顶部地址栏 |
-| `BOT_TOKEN` | ✅ | Telegram [BotFather](https://t.me/BotFather) → `/newbot` |
-
-> ⚠️ 确认 Cloudflare Token 同时拥有 **Workers Edit** 和 **KV Edit** 权限，否则 KV 创建会失败。
-
-### Step 2 — 推代码触发部署
-
-```bash
-git push origin main
+```toml
+[[kv_namespaces]]
+binding = "LOTTERY_KV"
+id = "你的KV_NAMESPACE_ID"
+preview_id = "你的KV_NAMESPACE_ID"
 ```
 
-GitHub Actions 将自动：
-1. 创建 `LOTTERY_KV` 命名空间
-2. 将 KV ID 写入 `wrangler.toml`
-3. 部署到 Cloudflare Workers
+Cron 触发器已声明（`crons = ["* * * * *"]`），部署时自动创建，用于定时开奖检查。
 
-查看 **Actions** → 部署日志确认成功。
+### 3. 设置 Cloudflare Worker Secrets
 
-### Step 3 — 设置 Webhook
+在 Cloudflare Dashboard → Worker → Settings → Variables：
 
-从 Actions 日志或 Cloudflare Dashboard 获取 Worker URL，然后：
+| 变量 | 值 |
+|------|-----|
+| `BOT_TOKEN` | BotFather 给的 Token（**Secret**） |
+| `WEBHOOK_SECRET` | 任意随机字符串（**Secret**，可选） |
+
+### 4. GitHub Actions 一键部署
+
+- GitHub Secrets 只填两个：`CF_API_TOKEN`（Workers Edit + KV Edit 权限）、`CF_ACCOUNT_ID`
+- push 到 main 自动部署
+
+### 5. 设置 Webhook
 
 ```bash
-curl "https://api.telegram.org/bot你的TOKEN/setWebhook?url=https://tg-lottery-bot.YOURNAME.workers.dev"
+curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://<你的worker域名>/webhook"
 ```
 
-在 Telegram 发 `/start` 验证 ✅
+或使用 `scripts/setWebhook.mjs`。
 
----
+## 使用
 
-## 📖 命令一览
+1. 私聊机器人发送 `/create`，按引导完成 8 步
+2. 创建成功 → 公告自动发到选定的群（+频道）
+3. 参与者在群里发口令参与
+4. 到点/满员自动开奖；也可手动 `/draw <ID>`
 
-| 命令 | 说明 |
+## 权限说明
+
+| 操作 | 需要 |
 |------|------|
-| `/start` | 欢迎界面 |
-| `/help` | 详细帮助 |
-| `/create <标题>` | 创建抽奖 |
-| `/create <标题> - N人` | 指定中奖名额 |
-| `/join <ID>` | 参与抽奖 |
-| `/draw <ID>` | 开奖（仅创建者） |
-| `/list` | 所有抽奖列表 |
-| `/info <ID>` | 抽奖详情 |
-| `/my` | 我参与/创建的抽奖 |
-| `/cancel <ID>` | 取消抽奖（仅创建者） |
+| bot 发公告到群 | bot 是群成员（建议管理员） |
+| bot 发公告到频道 | bot 是频道管理员 |
+| 强制加频道校验 | bot 是频道管理员 |
+| 口令参与 | 群成员在群里发口令 |
 
----
-
-## 🏗️ 架构
+## 目录
 
 ```
-Telegram → Workers(Webhook) → KV(自动创建) → Telegram API
+src/index.js          # 主逻辑
+wrangler.toml         # Worker 配置（KV + Cron）
+.github/workflows/deploy.yml  # GitHub Actions 自动部署
 ```
-
----
-
-## 💰 成本
-
-Cloudflare Workers 免费：**10万次请求/天 + 10万次 KV 读取/天 + 1000次 KV 写入/天**。
-
----
-
-## 📄 License
-
-MIT

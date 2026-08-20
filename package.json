@@ -1,7 +1,7 @@
 {
   "name": "tg-lottery-bot",
-  "version": "3.0.0",
-  "description": "Telegram 抽奖机器人 v3.0 - Cloudflare Workers 优化版",
+  "version": "4.1.0",
+  "description": "Telegram 抽奖机器人 v4.1 - 私聊创建+发布群/频道",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
@@ -9,7 +9,13 @@
     "deploy": "wrangler deploy",
     "tail": "wrangler tail"
   },
-  "keywords": ["telegram", "bot", "lottery", "cloudflare-workers", "kv"],
+  "keywords": [
+    "telegram",
+    "bot",
+    "lottery",
+    "cloudflare-workers",
+    "kv"
+  ],
   "license": "MIT",
   "devDependencies": {
     "wrangler": "^4.0.0"

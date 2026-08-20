@@ -1,85 +1,789 @@
 /**
- * Telegram Lottery Bot v3.0 - Cloudflare Workers 版本
- * 优化：幂等处理 / 防并发竞态 / 加密安全随机 / 批量 KV 读写 / Webhook 签名验证 / 重试限流
+ * Telegram Lottery Bot v4.1 - Cloudflare Workers
+ * 私聊创建 + 发布到群聊/频道 + 口令参与 + 强制加频道 + 创建向导 + 私信中奖通知
  */
 
 const TELEGRAM_API = 'https://api.telegram.org';
-const WEBHOOK_SECRET = ''; // 部署时通过 wrangler secret put WEBHOOK_SECRET 设置（可选）
-const MAX_RETRIES = 3;
-const RETRY_DELAY_MS = 200; // 指数退避基数
-const RATE_LIMIT_WINDOW = 1000; // 1秒
-const RATE_LIMIT_MAX = 30; // 每秒最多30次请求
 
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-
-    // --- 健康检查 ---
-    if (request.method === 'GET' && url.pathname === '/health') {
+    if (request.method === 'GET') {
       return new Response(JSON.stringify({ status: 'ok', uptime: Date.now() }), {
         headers: { 'Content-Type': 'application/json' },
       });
     }
-
-    // --- Webhook 验证 ---
-    if (request.method === 'POST') {
-      if (!await verifyWebhook(request, env)) {
-        return new Response('Forbidden', { status: 403 });
-      }
-    }
-
-    // 只接受 POST
-    if (request.method !== 'POST') {
-      return new Response('Method Not Allowed', { status: 405 });
-    }
+    if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
 
     try {
       const update = await request.json();
-
-      // --- 幂等：跳过已处理的 update ---
       const updateId = update.update_id;
       if (updateId) {
         const seen = await env.LOTTERY_KV.get(`seen:${updateId}`);
-        if (seen) {
-          return new Response('OK');
-        }
-        // 标记已处理（30天过期）
-        ctx.waitUntil(env.LOTTERY_KV.put(`seen:${updateId}`, '1', { expirationTtl: 2592000 }));
+        if (seen) return new Response('OK');
+        ctx.waitUntil(env.LOTTERY_KV.put(`seen:${updateId}`, '1', { expirationTtl: 86400 }));
       }
-
       await handleUpdate(update, env);
       return new Response('OK');
     } catch (err) {
-      console.error('Error handling update:', err);
-      return new Response('Internal Server Error', { status: 500 });
+      console.error('Error:', err);
+      return new Response('OK');
     }
+  },
+
+  // 每分钟触发：定时开奖检查
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(checkScheduledDraws(env));
   },
 };
 
-// ==================== Webhook 签名验证 ====================
+// ==================== 定时开奖（Cron） ====================
 
-async function verifyWebhook(request, env) {
-  // 未配置密钥时跳过验证
-  if (!env.WEBHOOK_SECRET) return true;
+async function checkScheduledDraws(env) {
+  try {
+    const raw = await env.LOTTERY_KV.get('scheduled_draws');
+    if (!raw) return;
+    const ids = JSON.parse(raw);
+    if (!Array.isArray(ids) || ids.length === 0) return;
 
-  const signature = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
-  if (!signature) return false;
-
-  const hmac = await crypto.subtle.sign(
-    'HMAC',
-    await crypto.subtle.importKey('raw', new TextEncoder().encode(env.WEBHOOK_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']),
-    new TextEncoder().encode(await request.text()),
-  );
-  const hmacHex = Array.from(new Uint8Array(hmac)).map(b => b.toString(16).padStart(2, '0')).join('');
-  return hmacHex === signature;
+    const now = Date.now();
+    const remaining = [];
+    for (const id of ids) {
+      const kraw = await env.LOTTERY_KV.get(`lottery:${id}`);
+      if (!kraw) continue;
+      const lottery = JSON.parse(kraw);
+      if (lottery.status !== 'active') continue; // 已完成/取消，从列表剔除
+      if (now < lottery.triggerValue) {
+        remaining.push(id);
+        continue;
+      }
+      // 到点了
+      if (lottery.participants.length === 0) {
+        lottery.status = 'cancelled';
+        await env.LOTTERY_KV.put(`lottery:${id}`, JSON.stringify(lottery));
+        await sendMessage(lottery.groupId, `⏰ 开奖时间已到，但「${esc(lottery.name)}」无人参与，已自动取消`, env);
+      } else {
+        await executeDraw(id, lottery, env, lottery.groupName);
+      }
+      // 已处理，不加回 remaining
+    }
+    await env.LOTTERY_KV.put('scheduled_draws', JSON.stringify(remaining));
+  } catch (err) {
+    console.error('Scheduled draw error:', err);
+  }
 }
 
-// ==================== 带重试的 Telegram API 调用 ====================
+async function addToScheduled(env, lotteryId) {
+  const raw = await env.LOTTERY_KV.get('scheduled_draws');
+  let ids = raw ? JSON.parse(raw) : [];
+  if (!Array.isArray(ids)) ids = [];
+  if (!ids.includes(lotteryId)) ids.push(lotteryId);
+  await env.LOTTERY_KV.put('scheduled_draws', JSON.stringify(ids));
+}
 
-async function tgApi(env, method, body, retries = MAX_RETRIES) {
+async function removeFromScheduled(env, lotteryId) {
+  const raw = await env.LOTTERY_KV.get('scheduled_draws');
+  if (!raw) return;
+  let ids = JSON.parse(raw);
+  if (!Array.isArray(ids)) return;
+  ids = ids.filter(id => id !== lotteryId);
+  await env.LOTTERY_KV.put('scheduled_draws', JSON.stringify(ids));
+}
+
+// ==================== 路由 ====================
+
+async function handleUpdate(update, env) {
+  if (update.message) await handleMessage(update.message, env);
+  else if (update.callback_query) await handleCallbackQuery(update.callback_query, env);
+  else if (update.my_chat_member) await handleMyChatMember(update.my_chat_member, env);
+}
+
+async function handleMessage(msg, env) {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const username = msg.from.username || msg.from.first_name || `用户${userId}`;
+  const text = (msg.text || '').trim();
+  const chatType = msg.chat.type;
+  const chatTitle = msg.chat.title || '';
+
+  // ---- 命令 ----
+  if (text.startsWith('/')) {
+    const [cmd, ...args] = text.split(/\s+/);
+    const cmdLower = cmd.toLowerCase();
+    if (cmdLower === '/start') {
+      return sendMessage(chatId, '🎉 **抽奖机器人 v4.1**\n\n私聊中发送 /create 即可创建抽奖，创建后公告会发布到你选择的群聊（和频道）！', env);
+    }
+    if (cmdLower === '/create') {
+      return startWizard(chatId, userId, username, chatTitle, env);
+    }
+    if (cmdLower === '/draw') {
+      return drawLottery(chatId, userId, args[0], env, chatTitle);
+    }
+    if (cmdLower === '/cancel') {
+      return cancelLotteryCmd(chatId, userId, args[0], env, chatTitle);
+    }
+    if (cmdLower === '/list') {
+      return listLotteries(chatId, env, chatTitle, userId);
+    }
+    if (cmdLower === '/groups') {
+      return refreshGroupsCmd(chatId, userId, env);
+    }
+    return;
+  }
+
+  // ---- 私聊：向导步骤 ----
+  if (chatType === 'private') {
+    return handleWizardStep(chatId, userId, text, env);
+  }
+
+  // ---- 群聊：检查口令 ----
+  if (chatType === 'group' || chatType === 'supergroup') {
+    return checkKeyword(chatId, userId, username, text, chatTitle, env);
+  }
+}
+
+// ==================== Bot 入群记录（发布目标群列表） ====================
+
+async function handleMyChatMember(mcm, env) {
+  const chat = mcm.chat;
+  if (!chat || (chat.type !== 'group' && chat.type !== 'supergroup')) return;
+  const newStatus = mcm.new_chat_member?.status || '';
+
+  const key = 'bot_groups';
+  const raw = await env.LOTTERY_KV.get(key);
+  let groups = raw ? JSON.parse(raw) : [];
+  if (!Array.isArray(groups)) groups = [];
+
+  const idx = groups.findIndex(g => g.id === chat.id);
+  if (newStatus === 'left' || newStatus === 'kicked') {
+    if (idx >= 0) groups.splice(idx, 1);
+  } else if (newStatus === 'member' || newStatus === 'administrator' || newStatus === 'restricted') {
+    const g = { id: chat.id, title: chat.title || `群${chat.id}` };
+    if (idx >= 0) groups[idx] = g;
+    else groups.push(g);
+  }
+  await env.LOTTERY_KV.put(key, JSON.stringify(groups));
+}
+
+async function getBotGroups(env) {
+  const raw = await env.LOTTERY_KV.get('bot_groups');
+  if (!raw) return [];
+  const groups = JSON.parse(raw);
+  return Array.isArray(groups) ? groups : [];
+}
+// ==================== 创建向导（私聊） ====================
+
+async function startWizard(chatId, userId, username, chatTitle, env) {
+  // 仅允许私聊创建；群聊中提示去私聊
+  if (chatId < 0) {
+    return sendMessage(chatId, 'ℹ️ @抽奖机器人：创建抽奖请在私聊中发送 /create。', env);
+  }
+
+  const wizard = {
+    userId,
+    step: 1,
+    data: { name: '', prize: '', winnerCount: 1, keyword: '', triggerType: '', triggerValue: null, channel: '', groupId: null, groupName: '' },
+  };
+  await env.LOTTERY_KV.put(`wizard:${userId}`, JSON.stringify(wizard), { expirationTtl: 3600 });
+
+  const kb = [[{ text: '❌ 取消创建', callback_data: 'cancel_wizard' }]];
+  return sendMsgKb(chatId, `🎯 **抽奖创建向导**（第1步/共8步）\n\n📝 请输入**抽奖活动名称**：`, kb, env);
+}
+
+async function handleWizardStep(chatId, userId, text, env) {
+  const wizardKey = `wizard:${userId}`;
+  const raw = await env.LOTTERY_KV.get(wizardKey);
+  if (!raw) return;
+
+  const wizard = JSON.parse(raw);
+  if (wizard.step < 1 || wizard.step > 8) return;
+
+  const kb = [[{ text: '❌ 取消创建', callback_data: 'cancel_wizard' }]];
+
+  switch (wizard.step) {
+    case 1: // 活动名称
+      wizard.data.name = text;
+      wizard.step = 2;
+      await env.LOTTERY_KV.put(wizardKey, JSON.stringify(wizard), { expirationTtl: 3600 });
+      return sendMsgKb(chatId, `✅ 活动名称：**${esc(text)}**\n\n🎁 第2步：请输入**奖品名称**：`, kb, env);
+
+    case 2: // 奖品
+      wizard.data.prize = text;
+      wizard.step = 3;
+      await env.LOTTERY_KV.put(wizardKey, JSON.stringify(wizard), { expirationTtl: 3600 });
+      return sendMsgKb(chatId, `✅ 奖品：**${esc(text)}**\n\n🏆 第3步：请输入**中奖名额数量**（默认1人）：`, kb, env);
+
+    case 3: // 中奖名额
+      let wc = parseInt(text);
+      if (isNaN(wc) || wc < 1 || wc > 100) {
+        return sendMsgKb(chatId, '❌ 请输入1~100之间的数字', kb, env);
+      }
+      wizard.data.winnerCount = wc;
+      wizard.step = 4;
+      await env.LOTTERY_KV.put(wizardKey, JSON.stringify(wizard), { expirationTtl: 3600 });
+      return sendMsgKb(chatId, `✅ 中奖名额：**${wc} 人**\n\n🔑 第4步：请输入**参与口令**\n参与者在群内发送此口令即可参与：`, kb, env);
+
+    case 4: // 口令
+      if (!text.trim()) {
+        return sendMsgKb(chatId, '❌ 口令不能为空', kb, env);
+      }
+      wizard.data.keyword = text.trim();
+      wizard.step = 5;
+      await env.LOTTERY_KV.put(wizardKey, JSON.stringify(wizard), { expirationTtl: 3600 });
+      const triggerKb = [
+        [{ text: '⏰ 定时开奖', callback_data: 'trigger_type:time' },
+         { text: '👥 人数开奖', callback_data: 'trigger_type:count' }],
+        [{ text: '❌ 取消创建', callback_data: 'cancel_wizard' }],
+      ];
+      return sendMsgKb(chatId, `✅ 口令：\`${esc(wizard.data.keyword)}\`\n\n⏰ 第5步：请选择**开奖方式**：`, triggerKb, env);
+
+    case 6: // 开奖条件值
+      if (wizard.data.triggerType === 'time') {
+        const timeMatch = text.match(/(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s+(\d{1,2}):(\d{2})/);
+        if (!timeMatch) {
+          return sendMsgKb(chatId, '❌ 时间格式错误，请使用格式：`2024-12-25 20:00`', kb, env);
+        }
+        const [, y, m, d, h, min] = timeMatch;
+        const targetTime = new Date(+y, +m - 1, +d, +h, +min, 0);
+        if (targetTime <= Date.now()) {
+          return sendMsgKb(chatId, '❌ 开奖时间必须在当前时间之后', kb, env);
+        }
+        wizard.data.triggerValue = targetTime.getTime();
+      } else {
+        const count = parseInt(text);
+        if (isNaN(count) || count < 2 || count > 1000) {
+          return sendMsgKb(chatId, '❌ 请输入2~1000之间的数字', kb, env);
+        }
+        wizard.data.triggerValue = count;
+      }
+
+      wizard.step = 7;
+      await env.LOTTERY_KV.put(wizardKey, JSON.stringify(wizard), { expirationTtl: 3600 });
+
+      // 列出 bot 已加入的群供选择，或手动输入群 ID/链接
+      const groups = await getBotGroups(env);
+      if (groups.length === 0) {
+        return sendMsgKb(chatId, `⚠️ **还未找到可发布群**\n\n请先把机器人**加入目标群组**（并设为管理员），然后发送 \`/groups\` 刷新，或直接输入群 ID（如 \`-1001234567890\`）。`, kb, env);
+      }
+      const groupKb = [];
+      for (const g of groups.slice(0, 12)) {
+        groupKb.push([{ text: `📢 ${esc(g.title || g.id)}`, callback_data: `select_group:${g.id}` }]);
+      }
+      groupKb.push([{ text: '❌ 取消创建', callback_data: 'cancel_wizard' }]);
+      return sendMsgKb(chatId, `✅ ${
+        wizard.data.triggerType === 'time' ? '开奖时间' : '人数上限'
+      }：\`${text}\`\n\n📢 第7步：请选择**公告发布群**（公告发到该群，参与也在此群）：`, groupKb, env);
+
+    case 7: // 选择发布群（也可手动输入群ID/链接）
+      const rawGroup = text.trim();
+      let groupId = null;
+      let groupName = '';
+
+      if (/^-?\d+$/.test(rawGroup)) {
+        groupId = parseInt(rawGroup);
+      } else {
+        // 尝试 t.me/ 链接或 @username → 需要 bot 已在群内，用 getChat 解析
+        const m = rawGroup.match(/t\.me\/([A-Za-z0-9_]+)/) || rawGroup.match(/^@?([A-Za-z0-9_]{3,})$/);
+        if (m) {
+          try {
+            const res = await tgApi(env, 'getChat', { chat_id: `@${m[1]}` });
+            if (res.ok) {
+              groupId = res.result.id;
+              groupName = res.result.title || m[1];
+            }
+          } catch {}
+        }
+        if (!groupId) {
+          return sendMsgKb(chatId, '❌ 无法解析该群，请直接输入群 ID（如 `-1001234567890`），或在第7步按钮中选择。', kb, env);
+        }
+      }
+
+      if (!groupId) {
+        return sendMsgKb(chatId, '❌ 请输入有效的群 ID，或从按钮中选择。', kb, env);
+      }
+
+      // 校验 bot 是否在该群（可选，放宽：允许任意 ID）
+      wizard.data.groupId = groupId;
+      wizard.data.groupName = groupName;
+      wizard.step = 8;
+      await env.LOTTERY_KV.put(wizardKey, JSON.stringify(wizard), { expirationTtl: 3600 });
+      const channelKb = [
+        [{ text: '⏭️ 跳过（不发布到频道）', callback_data: 'skip_channel' }],
+        [{ text: '❌ 取消创建', callback_data: 'cancel_wizard' }],
+      ];
+      return sendMsgKb(chatId, `✅ 发布群：\`${groupId}\`${groupName ? `（${esc(groupName)}）` : ''}\n\n📢 第8步（可选）：请输入**频道**链接或用户名\n例如：\`@mychannel\`\n公告会同时发布到该频道（并可设为强制加频道）\n（点击跳过则只发布到群）`, channelKb, env);
+
+    case 8: // 频道（可选）
+      let channelInput = text.trim();
+      if (!channelInput) {
+        return sendMsgKb(chatId, '❌ 频道不能为空，或点「跳过」不发布到频道', kb, env);
+      }
+      channelInput = channelInput.replace(/^https?:\/\/t\.me\//i, '');
+      if (channelInput && !channelInput.startsWith('@')) channelInput = '@' + channelInput;
+      wizard.data.channel = channelInput;
+      await env.LOTTERY_KV.put(wizardKey, JSON.stringify(wizard), { expirationTtl: 3600 });
+      await finishWizard(chatId, null, userId, wizard, env);
+      return;
+
+    default:
+      return;
+  }
+}
+// ==================== 回调处理 ====================
+
+async function handleCallbackQuery(cb, env) {
+  const data = cb.data || '';
+  const chatId = cb.message.chat.id;
+  const userId = cb.from.id;
+  const msgId = cb.message.message_id;
+
+  const [action, ...params] = data.split(':');
+  const param = params.join(':');
+
+  try {
+    if (action === 'trigger_type') {
+      const wizardKey = `wizard:${userId}`;
+      const raw = await env.LOTTERY_KV.get(wizardKey);
+      if (!raw) return answerCb(cb.id, '⏰ 会话已过期，请重新 /create', env);
+      const wizard = JSON.parse(raw);
+      wizard.data.triggerType = param; // 'time' 或 'count'
+      wizard.step = 6;
+      await env.LOTTERY_KV.put(wizardKey, JSON.stringify(wizard), { expirationTtl: 3600 });
+
+      if (param === 'time') {
+        await editMsg(chatId, msgId, `⏰ **定时开奖**\n\n请输入开奖时间（格式：\`2024-12-25 20:00\`，24小时制）：`, env);
+      } else {
+        await editMsg(chatId, msgId, `👥 **人数开奖**\n\n请输入参与人数上限（到达后自动开奖，例如：\`50\`）：`, env);
+      }
+      return answerCb(cb.id, '', env);
+    }
+
+    if (action === 'select_group') {
+      const wizardKey = `wizard:${userId}`;
+      const raw = await env.LOTTERY_KV.get(wizardKey);
+      if (!raw) return answerCb(cb.id, '⏰ 会话已过期', env);
+      const wizard = JSON.parse(raw);
+      const groupId = parseInt(param);
+      const groups = await getBotGroups(env);
+      const g = groups.find(x => x.id === groupId);
+      wizard.data.groupId = groupId;
+      wizard.data.groupName = g?.title || '';
+      wizard.step = 8;
+      await env.LOTTERY_KV.put(wizardKey, JSON.stringify(wizard), { expirationTtl: 3600 });
+      const channelKb = [
+        [{ text: '⏭️ 跳过（不发布到频道）', callback_data: 'skip_channel' }],
+        [{ text: '❌ 取消创建', callback_data: 'cancel_wizard' }],
+      ];
+      await editMsg(chatId, msgId, `✅ 发布群：\`${groupId}\`${g?.title ? `（${esc(g.title)}）` : ''}\n\n📢 第8步（可选）：请输入**频道**链接或用户名\n例如：\`@mychannel\`\n公告会同时发布到该频道（并可设为强制加频道）\n（点击跳过则只发布到群）`, env, channelKb);
+      return answerCb(cb.id, '✅ 已选择', env);
+    }
+
+    if (action === 'skip_channel') {
+      const wizardKey = `wizard:${userId}`;
+      const raw = await env.LOTTERY_KV.get(wizardKey);
+      if (!raw) return answerCb(cb.id, '⏰ 会话已过期', env);
+      const wizard = JSON.parse(raw);
+      wizard.data.channel = '';
+      await env.LOTTERY_KV.put(wizardKey, JSON.stringify(wizard), { expirationTtl: 3600 });
+      await editMsg(chatId, msgId, '⏭️ 已跳过，只发布到群', env);
+      await finishWizard(chatId, msgId, userId, wizard, env);
+      return answerCb(cb.id, '✅ 跳过', env);
+    }
+
+    if (action === 'cancel_wizard') {
+      const wizardKey = `wizard:${userId}`;
+      await env.LOTTERY_KV.delete(wizardKey);
+      await editMsg(chatId, msgId, '❌ 已取消创建', env);
+      return answerCb(cb.id, '已取消', env);
+    }
+
+    await answerCb(cb.id, '', env);
+  } catch (err) {
+    console.error('Callback error:', err);
+    await answerCb(cb.id, '处理出错', env);
+  }
+}
+
+// ==================== 完成创建 ====================
+
+async function finishWizard(chatId, msgId, userId, wizard, env) {
+  // 生成抽奖 ID
+  const buf = new Uint8Array(8);
+  crypto.getRandomValues(buf);
+  const lotteryId = Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase().slice(0, 8);
+
+  const now = Date.now();
+  const lottery = {
+    id: lotteryId,
+    groupId: wizard.data.groupId,
+    groupName: wizard.data.groupName,
+    creatorId: userId,
+    name: wizard.data.name,
+    prize: wizard.data.prize,
+    winnerCount: wizard.data.winnerCount || 1,
+    keyword: wizard.data.keyword,
+    triggerType: wizard.data.triggerType,
+    triggerValue: wizard.data.triggerValue,
+    channel: wizard.data.channel || '',
+    participants: [],
+    participantNames: {},
+    winners: [],
+    status: 'active',
+    createdAt: now,
+    drawnAt: null,
+  };
+
+  if (!lottery.groupId) {
+    return sendMessage(chatId, '❌ 未选择发布群，创建失败。请重新 /create。', env);
+  }
+
+  await env.LOTTERY_KV.put(`lottery:${lotteryId}`, JSON.stringify(lottery));
+  await addToGroupIndex(env, lottery.groupId, lotteryId);
+  if (lottery.triggerType === 'time') await addToScheduled(env, lotteryId);
+
+  // 删除向导状态
+  await env.LOTTERY_KV.delete(`wizard:${userId}`);
+
+  // 校验 bot 是否在发布群内（不在则提示，不发公告）
+  const botInGroup = await checkBotInChat(lottery.groupId, env);
+
+  const triggerText = lottery.triggerType === 'time'
+    ? `⏰ 开奖时间：${fmtDate(lottery.triggerValue)}`
+    : `👥 满 ${lottery.triggerValue} 人自动开奖`;
+
+  const channelText = lottery.channel
+    ? `\n📢 频道：${lottery.channel}`
+    : '';
+
+  // 发布到群
+  const groupPost = `🎊 **抽奖开始啦！** 🎊
+
+━━━━━━━━━━━━━━━━
+📝 **活动名称：** ${esc(lottery.name)}
+🎁 **奖品：** ${esc(lottery.prize)}
+🏆 **中奖名额：** ${lottery.winnerCount} 人
+${triggerText}${channelText}
+━━━━━━━━━━━━━━━━
+
+🔑 在群内发送口令 \`${lottery.keyword}\` 即可参与抽奖！`;
+
+  if (botInGroup) {
+    await sendMessage(lottery.groupId, groupPost, env);
+  }
+
+  // 发布到频道（如有）
+  if (lottery.channel) {
+    try { await sendMessage(lottery.channel, groupPost, env); } catch {}
+  }
+
+  // 私聊给创建者确认
+  const botWarn = botInGroup
+    ? ''
+    : `\n⚠️ **机器人不在发布群中**，公告未能发布！\n请把机器人加入该群（设为管理员）后，手动发送公告或在私聊中使用 /groups 检查。`;
+
+  const confirmText = `✅ **创建成功！**
+
+🆔 **ID：** \`${lottery.id}\`
+📢 **发布群：** \`${lottery.groupId}\`${lottery.groupName ? `（${esc(lottery.groupName)}）` : ''}
+${lottery.channel ? `📢 **频道：** ${lottery.channel}` : ''}
+🔑 **口令：** \`${lottery.keyword}\`
+${botWarn}
+💡 查看抽奖：\`/list\` · 手动开奖：\`/draw ${lottery.id}\` · 取消：\`/cancel ${lottery.id}\``;
+
+  if (msgId) {
+    await editMsg(chatId, msgId, confirmText, env);
+  } else {
+    await sendMessage(chatId, confirmText, env);
+  }
+}
+
+// ==================== 口令参与 ====================
+
+async function checkKeyword(chatId, userId, username, text, chatTitle, env) {
+  // 查找该群所有进行中的抽奖
+  const indexData = await env.LOTTERY_KV.get(`group:${chatId}:lotteries`);
+  if (!indexData) return;
+
+  const ids = JSON.parse(indexData);
+  const now = Date.now();
+
+  for (const id of ids) {
+    const raw = await env.LOTTERY_KV.get(`lottery:${id}`);
+    if (!raw) continue;
+    const lottery = JSON.parse(raw);
+    if (lottery.status !== 'active') continue;
+
+    // 检查定时开奖（每次有人发消息时检查）
+    if (lottery.triggerType === 'time' && now >= lottery.triggerValue) {
+      if (lottery.participants.length === 0) {
+        lottery.status = 'cancelled';
+        await env.LOTTERY_KV.put(`lottery:${id}`, JSON.stringify(lottery));
+        await sendMessage(chatId, `⏰ 开奖时间已到，但「${esc(lottery.name)}」无人参与，已自动取消`, env);
+        continue;
+      }
+      await executeDraw(id, lottery, env, chatTitle);
+      continue;
+    }
+
+    // 检查口令
+    if (text.trim() !== lottery.keyword) continue;
+
+    // 检查是否已参与
+    if (lottery.participants.includes(userId)) {
+      return sendMessage(chatId, `⚠️ ${esc(username)}，你已经参与过「${esc(lottery.name)}」了，请等待开奖结果~`, env);
+    }
+
+    // 检查频道（强制加频道）
+    if (lottery.channel) {
+      const isMember = await checkChannelMembership(lottery.channel, userId, env);
+      if (!isMember) {
+        return sendMessage(chatId, `❌ ${esc(username)}，请先加入频道 ${lottery.channel} 后再参与抽奖！`, env);
+      }
+    }
+
+    // 加入参与者
+    lottery.participants.push(userId);
+    lottery.participantNames[userId] = username;
+    const count = lottery.participants.length;
+    await env.LOTTERY_KV.put(`lottery:${id}`, JSON.stringify(lottery));
+
+    await sendMessage(chatId, `✅ ${esc(username)} 参与成功！「${esc(lottery.name)}」当前 ${count} 人参与 🎯`, env);
+
+    // 检查是否需要自动开奖（人数到达）
+    if (lottery.triggerType === 'count' && count >= lottery.triggerValue) {
+      await executeDraw(id, lottery, env, chatTitle);
+    }
+
+    return;
+  }
+}
+
+async function checkChannelMembership(channel, userId, env) {
+  const channelName = channel.replace('@', '').trim();
+  if (!channelName) return true;
+
+  try {
+    const res = await tgApi(env, 'getChatMember', {
+      chat_id: `@${channelName}`,
+      user_id: userId,
+    });
+    if (!res.ok) return false;
+    const status = res.result.status;
+    return ['member', 'administrator', 'creator'].includes(status);
+  } catch {
+    return false;
+  }
+}
+// ==================== 开奖 ====================
+
+async function drawLottery(chatId, userId, lotteryId, env, chatTitle) {
+  if (!lotteryId) {
+    return sendMessage(chatId, '❌ 请提供抽奖ID\n用法：`/draw <抽奖ID>`', env);
+  }
+  const raw = await env.LOTTERY_KV.get(`lottery:${lotteryId}`);
+  if (!raw) return sendMessage(chatId, `❌ 抽奖 \`${lotteryId}\` 不存在`, env);
+
+  const lottery = JSON.parse(raw);
+  if (userId !== lottery.creatorId) {
+    return sendMessage(chatId, '❌ 只有创建者才能开奖', env);
+  }
+  if (lottery.status !== 'active') {
+    return sendMessage(chatId, '⚠️ 此抽奖已结束或已取消', env);
+  }
+  if (lottery.participants.length === 0) {
+    return sendMessage(chatId, '😢 暂无人参与，无法开奖', env);
+  }
+
+  return executeDraw(lotteryId, lottery, env, chatTitle);
+}
+
+async function executeDraw(lotteryId, lottery, env, chatTitle) {
+  const participants = lottery.participants;
+  const winnerCount = Math.min(lottery.winnerCount || 1, participants.length);
+  const winners = securePick(participants, winnerCount);
+
+  lottery.status = 'completed';
+  lottery.winners = winners;
+  lottery.drawnAt = Date.now();
+  await env.LOTTERY_KV.put(`lottery:${lotteryId}`, JSON.stringify(lottery));
+  await removeFromScheduled(env, lotteryId);
+
+  const winnerNames = winners.map(id => lottery.participantNames[id] || `用户${id}`);
+
+  // 群内公告
+  const winnerList = winnerNames.map((n, i) => `${i + 1}. @${esc(n)}`).join('\n');
+  const groupText = `🎊🎊🎊 **开奖啦！** 🎊🎊🎊
+
+━━━━━━━━━━━━━━━━━━
+📝 **活动：** ${esc(lottery.name)}
+🎁 **奖品：** ${esc(lottery.prize)}
+👥 **参与人数：** ${participants.length} 人
+🏆 **中奖人数：** ${winnerCount} 人
+━━━━━━━━━━━━━━━━━━
+
+🎉 **中奖者：**
+${winnerList}
+
+🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉`;
+  await sendMessage(lottery.groupId, groupText, env);
+  if (lottery.channel) {
+    try { await sendMessage(lottery.channel, groupText, env); } catch {}
+  }
+
+  // 私信通知中奖者
+  for (const winnerId of winners) {
+    const name = lottery.participantNames[winnerId] || `用户${winnerId}`;
+    const dmText = `🥳🥳 **恭喜中奖啦！** 🥳🥳
+
+━━━━━━━━━━━━━━━━
+**抽奖群：** ${esc(chatTitle || lottery.groupName)}
+**活动名称：** ${esc(lottery.name)}
+**获得奖品：** ${esc(lottery.prize)}
+━━━━━━━━━━━━━━━━
+
+『联系该群管理领取您的奖品吧~』
+
+🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉`;
+    try { await sendMessage(winnerId, dmText, env); }
+    catch { console.log(`Cannot DM ${winnerId}`); }
+  }
+
+  // 通知创建者
+  const creatorList = winnerNames.map((n, i) => `${i + 1}- ${n}  获得:${esc(lottery.prize)}`).join('\n');
+  const creatorText = `💐💐💐 **开奖了** 💐💐💐
+
+**${esc(lottery.name)}** 开奖了!
+本期总参与人数: ${participants.length}
+
+${creatorList}
+
+谨祝中奖用户大吉大利万事顺意`;
+  try { await sendMessage(lottery.creatorId, creatorText, env); }
+  catch { console.log(`Cannot DM creator ${lottery.creatorId}`); }
+}
+
+// ==================== 取消 / 列表 ====================
+
+async function cancelLotteryCmd(chatId, userId, lotteryId, env, chatTitle) {
+  if (!lotteryId) return sendMessage(chatId, '❌ 用法：`/cancel <抽奖ID>`', env);
+  const raw = await env.LOTTERY_KV.get(`lottery:${lotteryId}`);
+  if (!raw) return sendMessage(chatId, `❌ 抽奖 \`${lotteryId}\` 不存在`, env);
+  const lottery = JSON.parse(raw);
+  if (userId !== lottery.creatorId) return sendMessage(chatId, '❌ 只有创建者才能取消', env);
+  if (lottery.status !== 'active') return sendMessage(chatId, '⚠️ 此抽奖已结束或已取消', env);
+  lottery.status = 'cancelled';
+  await env.LOTTERY_KV.put(`lottery:${lotteryId}`, JSON.stringify(lottery));
+  await removeFromScheduled(env, lotteryId);
+  return sendMessage(chatId, `✅ 抽奖 \`${lotteryId}\` 已取消`, env);
+}
+
+async function listLotteries(chatId, env, chatTitle, userId) {
+  // 私聊：返回我创建的所有进行中抽奖；群聊：返回本群抽奖
+  const isPrivate = chatId > 0;
+  let active = [];
+
+  if (isPrivate) {
+    const groups = await getBotGroups(env);
+    for (const g of groups) {
+      const indexData = await env.LOTTERY_KV.get(`group:${g.id}:lotteries`);
+      if (!indexData) continue;
+      const ids = JSON.parse(indexData);
+      for (const id of ids) {
+        const raw = await env.LOTTERY_KV.get(`lottery:${id}`);
+        if (!raw) continue;
+        const l = JSON.parse(raw);
+        if (l.status === 'active' && (l.creatorId === userId || !userId)) active.push(l);
+      }
+    }
+  } else {
+    const indexData = await env.LOTTERY_KV.get(`group:${chatId}:lotteries`);
+    if (indexData) {
+      const ids = JSON.parse(indexData);
+      for (const id of ids) {
+        const raw = await env.LOTTERY_KV.get(`lottery:${id}`);
+        if (raw) {
+          const l = JSON.parse(raw);
+          if (l.status === 'active') active.push(l);
+        }
+      }
+    }
+  }
+  if (active.length === 0) return sendMessage(chatId, '📭 当前没有进行中的抽奖', env);
+  let text = '📋 **进行中的抽奖：**\n\n';
+  active.forEach((l, i) => {
+    const trigger = l.triggerType === 'time' ? `⏰ ${fmtDate(l.triggerValue)}` : `👥 ${l.participants.length}/${l.triggerValue}人`;
+    text += `${i + 1}. **${esc(l.name)}**\n`;
+    text += `   🆔 \`${l.id}\` · 🎁 ${esc(l.prize)} · 👥 ${l.participants.length}人 · ${trigger}\n\n`;
+  });
+  return sendMessage(chatId, text, env);
+}
+
+// ==================== 管理命令：刷新群列表 ====================
+
+async function refreshGroupsCmd(chatId, userId, env) {
+  const groups = await getBotGroups(env);
+  if (groups.length === 0) {
+    return sendMessage(chatId, '🤖 我还没有加入任何群组。\n\n请把机器人**加入目标群组**（设为管理员），然后再次发送 /groups。', env);
+  }
+  const list = groups.map(g => `• \`${g.id}\` ${g.title ? `（${esc(g.title)}）` : ''}`).join('\n');
+  return sendMessage(chatId, `🤖 我已加入的群组（${groups.length} 个）：\n\n${list}`, env);
+}
+
+// ==================== 工具函数 ====================
+
+function securePick(arr, count) {
+  const shuffled = [...arr];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const buf = new Uint8Array(4);
+    crypto.getRandomValues(buf);
+    let rand = 0;
+    for (let b = 0; b < 4; b++) rand = (rand << 8) | buf[b];
+    const j = Math.abs(rand % (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled.slice(0, count);
+}
+
+function fmtDate(ts) {
+  const d = new Date(ts);
+  const pad = n => n.toString().padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function esc(text) {
+  return String(text).replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, '\\$&');
+}
+
+// 检查 bot 是否在该 chat 内（getChatMember 用 bot 自己的 token 取 bot id）
+async function checkBotInChat(chatId, env) {
+  try {
+    const botToken = env.BOT_TOKEN || '';
+    const botId = botToken.split(':')[0];
+    if (!botId) return false;
+    const res = await tgApi(env, 'getChatMember', {
+      chat_id: chatId,
+      user_id: parseInt(botId),
+    });
+    if (!res.ok) return false;
+    return ['member', 'administrator', 'creator', 'restricted'].includes(res.result.status);
+  } catch {
+    return false;
+  }
+}
+
+async function addToGroupIndex(env, groupId, lotteryId) {
+  const raw = await env.LOTTERY_KV.get(`group:${groupId}:lotteries`);
+  let ids = raw ? JSON.parse(raw) : [];
+  ids = ids.filter(id => id !== lotteryId);
+  ids.unshift(lotteryId);
+  ids = ids.slice(0, 50);
+  await env.LOTTERY_KV.put(`group:${groupId}:lotteries`, JSON.stringify(ids));
+}
+
+// ==================== Telegram API ====================
+
+async function tgApi(env, method, body, retries = 3) {
   const token = env.BOT_TOKEN;
   const url = `${TELEGRAM_API}/bot${token}/${method}`;
-
   for (let i = 0; i < retries; i++) {
     try {
       const res = await fetch(url, {
@@ -89,603 +793,51 @@ async function tgApi(env, method, body, retries = MAX_RETRIES) {
       });
       const data = await res.json();
       if (data.ok) return data;
-
-      // 429 Too Many Requests — 按 Retry-After 退避
       if (res.status === 429) {
-        const retryAfter = parseInt(res.headers.get('Retry-After') || '1');
-        console.log(`Rate limited, waiting ${retryAfter}s...`);
-        await new Promise(r => setTimeout(r, retryAfter * 1000));
+        const wait = parseInt(res.headers.get('Retry-After') || '1');
+        await new Promise(r => setTimeout(r, wait * 1000));
         continue;
       }
-
-      // 其他错误直接返回
-      console.warn(`TG API ${method} error:`, data);
+      console.warn(`TG ${method} error:`, data);
       return data;
     } catch (err) {
-      console.warn(`TG API ${method} attempt ${i+1} failed:`, err);
-      if (i < retries - 1) {
-        await new Promise(r => setTimeout(r, RETRY_DELAY_MS * 2 ** i));
-      } else {
-        throw err;
-      }
+      console.warn(`TG ${method} attempt ${i + 1}:`, err);
+      if (i < retries - 1) await new Promise(r => setTimeout(r, 200 * 2 ** i));
+      else throw err;
     }
   }
 }
 
-async function sendMessage(chatId, text, env, extra = {}) {
+async function sendMessage(chatId, text, env) {
   return tgApi(env, 'sendMessage', {
     chat_id: chatId,
     text,
     parse_mode: 'Markdown',
     disable_web_page_preview: true,
-    ...extra,
   });
 }
 
-async function sendMessageWithKeyboard(chatId, text, keyboard, env, extra = {}) {
+async function sendMsgKb(chatId, text, kb, env) {
   return tgApi(env, 'sendMessage', {
     chat_id: chatId,
     text,
     parse_mode: 'Markdown',
     disable_web_page_preview: true,
-    reply_markup: { inline_keyboard: keyboard },
-    ...extra,
+    reply_markup: { inline_keyboard: kb },
   });
 }
 
-async function editMessageText(messageId, chatId, text, env, keyboard) {
+async function editMsg(chatId, msgId, text, env, kb) {
   return tgApi(env, 'editMessageText', {
     chat_id: chatId,
-    message_id: messageId,
+    message_id: msgId,
     text,
     parse_mode: 'Markdown',
     disable_web_page_preview: true,
-    ...(keyboard ? { reply_markup: { inline_keyboard: keyboard } } : {}),
+    ...(kb ? { reply_markup: { inline_keyboard: kb } } : {}),
   });
 }
 
-async function answerCallbackQuery(callbackQueryId, text = '', env) {
-  await tgApi(env, 'answerCallbackQuery', { callback_query_id: callbackQueryId, text });
-}
-
-// ==================== 核心处理 ====================
-
-async function handleUpdate(update, env) {
-  if (update.message) {
-    await handleMessage(update.message, env);
-  } else if (update.callback_query) {
-    await handleCallbackQuery(update.callback_query, env);
-  }
-}
-
-async function handleMessage(message, env) {
-  const chatId = message.chat.id;
-  const text = (message.text || '').trim();
-  const userId = message.from.id;
-  const username = message.from.username || message.from.first_name || `用户${userId}`;
-
-  if (!text.startsWith('/')) return;
-
-  const [command, ...args] = text.split(/\s+/);
-
-  switch (command.toLowerCase()) {
-    case '/start':  return sendCommandHelp(chatId, env);
-    case '/help':   return sendHelp(chatId, env);
-    case '/create': return createLottery(chatId, userId, args.join(' '), env);
-    case '/join':   return joinLottery(chatId, userId, username, args[0], env);
-    case '/draw':   return drawLottery(chatId, userId, args[0], env);
-    case '/list':   return listLotteries(chatId, env);
-    case '/info':   return showLotteryInfo(chatId, args[0], env);
-    case '/my':     return myLotteries(chatId, userId, env);
-    case '/cancel': return cancelLottery(chatId, userId, args[0], env);
-    default:        return sendMessage(chatId, '❌ 未知命令，请使用 /help 查看帮助', env);
-  }
-}
-
-async function handleCallbackQuery(callbackQuery, env) {
-  const data = callbackQuery.data || '';
-  const chatId = callbackQuery.message.chat.id;
-  const userId = callbackQuery.from.id;
-  const messageId = callbackQuery.message.message_id;
-  const chatGlobalId = callbackQuery.message.chat.id;
-
-  const [action, ...params] = data.split(':');
-  const param = params.join(':');
-
-  try {
-    switch (action) {
-      case 'join': {
-        const result = await joinLottery(chatId, userId,
-          callbackQuery.from.username || callbackQuery.from.first_name || '用户',
-          param, env);
-        await answerCallbackQuery(callbackQuery.id,
-          result === 'already_joined' ? '已参与过啦~' :
-          result === 'not_found' ? '抽奖不存在' :
-          result === 'not_active' ? '抽奖已结束或取消' :
-          '✅ 已参与抽奖！', env);
-        break;
-      }
-      case 'draw': {
-        await drawLottery(chatId, userId, param, env);
-        await answerCallbackQuery(callbackQuery.id, '🎲 开奖中...', env);
-        break;
-      }
-      case 'info': {
-        await showLotteryInfo(chatId, param, env);
-        await answerCallbackQuery(callbackQuery.id);
-        break;
-      }
-      case 'cancel': {
-        await cancelLottery(chatId, userId, param, env);
-        await answerCallbackQuery(callbackQuery.id);
-        break;
-      }
-      default:
-        await answerCallbackQuery(callbackQuery.id);
-    }
-  } catch (err) {
-    console.error('Callback error:', err);
-    await answerCallbackQuery(callbackQuery.id, '处理出错，请稍后再试', env);
-  }
-}
-
-// ==================== 命令实现 ====================
-
-// --- /create ---
-async function createLottery(chatId, creatorId, title, env) {
-  if (!title) {
-    return sendMessage(chatId, '❌ 请输入抽奖标题\n用法：`/create <标题>`\n例如：`/create 年会抽奖 - 3个中奖名额`', env);
-  }
-
-  // 解析中奖人数
-  let winnerCount = 1;
-  const countMatch = title.match(/[-–—]\s*(\d+)\s*[个名额人]?/);
-  if (countMatch) {
-    winnerCount = Math.max(1, Math.min(parseInt(countMatch[1]), 100));
-    title = title.replace(/[-–—]\s*\d+\s*[个名额人]?\s*$/, '').trim();
-    if (!title) title = '抽奖';
-  }
-
-  const lotteryId = generateLotteryId();
-  const now = Date.now();
-
-  const lottery = {
-    id: lotteryId,
-    title,
-    creatorId,
-    chatId,
-    winnerCount,
-    status: 'active',
-    createdAt: now,
-    drawnAt: null,
-    participants: new Set(),     // 用 Set 代替数组，O(1) 查询
-    participantNames: {},        // userId -> username 缓存
-    winners: [],
-    version: 1,                  // 乐观锁版本号
-  };
-
-  // 首次写入：用 version 字段做乐观锁
-  await env.LOTTERY_KV.put(`lottery:${lotteryId}`, JSON.stringify(lottery), { metadata: { version: 1 } });
-  await addToChatIndex(env, chatId, lotteryId);
-
-  const text = `
-🎊 **新抽奖已创建！**
-
-📝 **标题：** ${esc(title)}
-🆔 **ID：** \`${lotteryId}\`
-🏆 **中奖名额：** ${winnerCount} 人
-⏰ **创建时间：** ${fmtDate(now)}
-
-👇 点击下方按钮参与抽奖！`;
-
-  const kb = [
-    [{ text: '🎯 参与抽奖', callback_data: `join:${lotteryId}` }],
-    [{ text: '📊 查看详情', callback_data: `info:${lotteryId}` },
-     { text: '🎲 立即开奖', callback_data: `draw:${lotteryId}` }],
-  ];
-
-  const sent = await sendMessageWithKeyboard(chatId, text, kb, env);
-  // 保存消息ID用于后续编辑
-  if (sent?.result?.message_id) {
-    await env.LOTTERY_KV.put(`msg:${lotteryId}`, sent.result.message_id.toString());
-  }
-
-  return sent;
-}
-
-// --- /join（带乐观锁防并发） ---
-async function joinLottery(chatId, userId, username, lotteryId, env) {
-  if (!lotteryId) {
-    return sendMessage(chatId, '❌ 请提供抽奖ID\n用法：`/join <抽奖ID>`', env);
-  }
-
-  const raw = await env.LOTTERY_KV.get(`lottery:${lotteryId}`, { metadata: true });
-  if (!raw) return 'not_found';
-
-  const lottery = JSON.parse(raw);
-  if (lottery.status !== 'active') return 'not_active';
-
-  // 检查是否已参与（Set 的 has 是 O(1)）
-  if (lottery.participants.has(userId)) return 'already_joined';
-
-  // 乐观锁：先读版本，修改后带版本回写
-  const currentVersion = lottery.version || 1;
-
-  // 加入参与者
-  lottery.participants.add(userId);
-  lottery.participantNames[userId] = username;
-  lottery.version = currentVersion + 1;
-
-  // 尝试写入，如果 metadata 的 version 不匹配则重试
-  let attempts = 0;
-  let success = false;
-  while (attempts < 3 && !success) {
-    try {
-      await env.LOTTERY_KV.put(`lottery:${lotteryId}`, JSON.stringify(lottery), {
-        metadata: { version: lottery.version },
-      });
-      success = true;
-    } catch {
-      attempts++;
-      // 重新读取最新数据
-      const retry = await env.LOTTERY_KV.get(`lottery:${lotteryId}`, { metadata: true });
-      if (!retry) return 'not_found';
-      const fresh = JSON.parse(retry);
-      if (fresh.status !== 'active') return 'not_active';
-      if (fresh.participants.has(userId)) return 'already_joined';
-      lottery.participants = fresh.participants;
-      lottery.participantNames = fresh.participantNames;
-      lottery.participants.add(userId);
-      lottery.participantNames[userId] = username;
-      lottery.version = (fresh.version || 1) + 1;
-    }
-  }
-
-  if (!success) {
-    return sendMessage(chatId, '⚠️ 参与人数变化中，请稍后重试', env);
-  }
-
-  const count = lottery.participants.size;
-  const text = `✅ **参与成功！** 当前 ${count} 人参与，中奖名额 ${lottery.winnerCount} 人。🤞 祝你好运！`;
-
-  // 如果原消息存在，尝试编辑；否则发送新消息
-  const msgId = await env.LOTTERY_KV.get(`msg:${lotteryId}`);
-  if (msgId) {
-    const editResult = await editMessageText(parseInt(msgId), chatId, text, env, [
-      [{ text: `📊 查看详情 (${count}人)`, callback_data: `info:${lotteryId}` }],
-    ]);
-    if (!editResult?.ok) {
-      // 编辑失败（消息可能被删除），改为发送新消息
-      await sendMessage(chatId, text, env);
-    }
-  } else {
-    await sendMessage(chatId, text, env);
-  }
-
-  return 'joined';
-}
-
-// --- /draw（加密安全随机 + 批量读用户名） ---
-async function drawLottery(chatId, userId, lotteryId, env) {
-  if (!lotteryId) {
-    return sendMessage(chatId, '❌ 请提供抽奖ID\n用法：`/draw <抽奖ID>`', env);
-  }
-
-  const raw = await env.LOTTERY_KV.get(`lottery:${lotteryId}`);
-  if (!raw) return sendMessage(chatId, `❌ 抽奖 \`${lotteryId}\` 不存在`, env);
-
-  const lottery = JSON.parse(raw);
-
-  if (userId !== lottery.creatorId) {
-    return sendMessage(chatId, '❌ 只有抽奖创建者才能开奖', env);
-  }
-  if (lottery.status !== 'active') {
-    return sendMessage(chatId, '⚠️ 此抽奖已结束或已取消', env);
-  }
-
-  // 将 Set 转回数组
-  const participants = Array.from(lottery.participants);
-  if (participants.length === 0) {
-    return sendMessage(chatId, '😢 暂无人参与，无法开奖', env);
-  }
-
-  // 加密安全的 Fisher-Yates（比 Math.random 更公平）
-  const winnerCount = Math.min(lottery.winnerCount, participants.length);
-  const winners = securePick(participants, winnerCount);
-
-  // 批量获取中奖者用户名
-  const winnerNames = winners.map(id => lottery.participantNames[id] || `用户${id}`);
-
-  // 更新状态
-  lottery.status = 'completed';
-  lottery.winners = winners;
-  lottery.drawnAt = Date.now();
-  await env.LOTTERY_KV.put(`lottery:${lotteryId}`, JSON.stringify(lottery));
-
-  const winnerList = winnerNames.map((name, i) => `  ${i + 1}. @${esc(name)}`).join('\n');
-
-  const text = `
-🎊🎊🎊 **开奖结果** 🎊🎊🎊
-
-📝 **抽奖：** ${esc(lottery.title)}
-🆔 **ID：** \`${lotteryId}\`
-👥 **总参与人数：** ${participants.length} 人
-🏆 **中奖名额：** ${winnerCount} 人
-
-━━━━━━━━━━━━━━━━━━━━━━━
-🎉 **中奖者：**
-${winnerList}
-━━━━━━━━━━━━━━━━━━━━━━━
-
-⏰ **开奖时间：** ${fmtDate(lottery.drawnAt)}
-
-🎯 开奖使用加密安全随机算法（Fisher-Yates + crypto.getRandomValues），确保公平公正。`;
-
-  await sendMessage(chatId, text, env);
-
-  const kb = [
-    [{ text: '📊 查看开奖详情', callback_data: `info:${lotteryId}` }],
-    [{ text: '🔄 创建新抽奖', callback_data: 'new' }],
-  ];
-  await sendMessageWithKeyboard(chatId, '🎉 恭喜中奖者！请及时联系组织者领取奖励！', kb, env);
-}
-
-// --- /list ---
-async function listLotteries(chatId, env) {
-  const indexData = await env.LOTTERY_KV.get(`chat:${chatId}:lotteries`);
-  if (!indexData) {
-    return sendMessage(chatId, '📭 当前没有抽奖记录\n使用 `/create <标题>` 创建一个吧！', env);
-  }
-
-  const lotteryIds = JSON.parse(indexData);
-  const results = [];
-
-  for (const id of lotteryIds) {
-    const data = await env.LOTTERY_KV.get(`lottery:${id}`);
-    if (data) {
-      const lottery = JSON.parse(data);
-      results.push(lottery);
-    }
-  }
-
-  if (results.length === 0) {
-    return sendMessage(chatId, '📭 当前没有抽奖记录', env);
-  }
-
-  // 按状态分组：active 在前
-  results.sort((a, b) => {
-    if (a.status === 'active' && b.status !== 'active') return -1;
-    if (a.status !== 'active' && b.status === 'active') return 1;
-    return b.createdAt - a.createdAt;
-  });
-
-  let text = '📋 **抽奖列表：**\n\n';
-  const kb = [];
-
-  results.forEach((lottery, idx) => {
-    const emoji = lottery.status === 'active' ? '🟢' : lottery.status === 'completed' ? '🏁' : '🔴';
-    const statusText = lottery.status === 'active' ? '进行中' : lottery.status === 'completed' ? '已结束' : '已取消';
-    const winners = lottery.status === 'completed' ? ` | 🎉 ${lottery.winners?.length || 0}人中奖` : '';
-    text += `${idx + 1}. ${emoji} **${esc(lottery.title)}**\n`;
-    text += `   \`${lottery.id}\` · ${statusText} · 👥 ${(lottery.participants?.size || lottery.participants?.length || 0)}人${winners}\n\n`;
-    kb.push([{ text: `${emoji} ${lottery.title}`, callback_data: `info:${lottery.id}` }]);
-  });
-
-  kb.push([{ text: '➕ 创建新抽奖', callback_data: 'new' }]);
-
-  return sendMessageWithKeyboard(chatId, text, kb, env);
-}
-
-// --- /info ---
-async function showLotteryInfo(chatId, lotteryId, env) {
-  if (!lotteryId) {
-    return sendMessage(chatId, '❌ 请提供抽奖ID', env);
-  }
-
-  const raw = await env.LOTTERY_KV.get(`lottery:${lotteryId}`);
-  if (!raw) return sendMessage(chatId, `❌ 抽奖 \`${lotteryId}\` 不存在`, env);
-
-  const lottery = JSON.parse(raw);
-  const participantCount = lottery.participants?.size || lottery.participants?.length || 0;
-
-  const statusEmoji = { active: '🟢', completed: '🏁', cancelled: '🔴' };
-  const statusText = { active: '进行中', completed: '已结束', cancelled: '已取消' };
-
-  let text = `
-📊 **抽奖详情**
-
-${statusEmoji[lottery.status]} **状态：** ${statusText[lottery.status]}
-📝 **标题：** ${esc(lottery.title)}
-🆔 **ID：** \`${lottery.id}\`
-🏆 **中奖名额：** ${lottery.winnerCount} 人
-👥 **参与人数：** ${participantCount} 人
-⏰ **创建时间：** ${fmtDate(lottery.createdAt)}`;
-
-  if (lottery.status === 'completed') {
-    text += `\n⏰ **开奖时间：** ${fmtDate(lottery.drawnAt)}`;
-    if (lottery.winners?.length > 0) {
-      text += '\n\n🎉 **中奖者：**\n';
-      lottery.winners.forEach((winnerId, i) => {
-        const name = lottery.participantNames?.[winnerId] || `用户${winnerId}`;
-        text += `  ${i + 1}. @${esc(name)}\n`;
-      });
-    }
-  }
-
-  if (lottery.status === 'active') {
-    const kb = [
-      [{ text: '🎯 参与抽奖', callback_data: `join:${lotteryId}` }],
-      [{ text: '🎲 开奖', callback_data: `draw:${lotteryId}` },
-       { text: '❌ 取消', callback_data: `cancel:${lotteryId}` }],
-    ];
-    return sendMessageWithKeyboard(chatId, text, kb, env);
-  }
-
-  return sendMessage(chatId, text, env);
-}
-
-// --- /my（补全实现） ---
-async function myLotteries(chatId, userId, env) {
-  const indexData = await env.LOTTERY_KV.get(`chat:${chatId}:lotteries`);
-  if (!indexData) {
-    return sendMessage(chatId, '📭 暂无抽奖记录', env);
-  }
-
-  const lotteryIds = JSON.parse(indexData);
-  const joined = [];
-  const created = [];
-
-  for (const id of lotteryIds) {
-    const raw = await env.LOTTERY_KV.get(`lottery:${id}`);
-    if (!raw) continue;
-    const lottery = JSON.parse(raw);
-    const participantCount = lottery.participants?.size || lottery.participants?.length || 0;
-
-    if (lottery.creatorId === userId) {
-      created.push({ ...lottery, participantCount });
-    } else if (lottery.participants?.has?.(userId) || (lottery.participants || []).includes(userId)) {
-      joined.push({ ...lottery, participantCount });
-    }
-  }
-
-  if (created.length === 0 && joined.length === 0) {
-    return sendMessage(chatId, '📭 你还没有参与或创建过抽奖', env);
-  }
-
-  let text = '📋 **我的抽奖：**\n\n';
-
-  if (created.length > 0) {
-    text += '🏆 **我创建的：**\n';
-    created.forEach(l => {
-      const emoji = l.status === 'active' ? '🟢' : l.status === 'completed' ? '🏁' : '🔴';
-      text += `  ${emoji} ${esc(l.title)} \`${l.id}\` · ${(l.participants?.size || l.participants?.length || 0)}人\n`;
-    });
-    text += '\n';
-  }
-
-  if (joined.length > 0) {
-    text += '🙋 **我参与的：**\n';
-    joined.forEach(l => {
-      const emoji = l.status === 'active' ? '🟢' : l.status === 'completed' ? '🏁' : '🔴';
-      text += `  ${emoji} ${esc(l.title)} \`${l.id}\` · ${(l.participants?.size || l.participants?.length || 0)}人\n`;
-    });
-  }
-
-  return sendMessage(chatId, text, env);
-}
-
-// --- /cancel ---
-async function cancelLottery(chatId, userId, lotteryId, env) {
-  if (!lotteryId) {
-    return sendMessage(chatId, '❌ 请提供抽奖ID\n用法：`/cancel <抽奖ID>`', env);
-  }
-
-  const raw = await env.LOTTERY_KV.get(`lottery:${lotteryId}`);
-  if (!raw) return sendMessage(chatId, `❌ 抽奖 \`${lotteryId}\` 不存在`, env);
-
-  const lottery = JSON.parse(raw);
-
-  if (userId !== lottery.creatorId) {
-    return sendMessage(chatId, '❌ 只有抽奖创建者才能取消', env);
-  }
-  if (lottery.status !== 'active') {
-    return sendMessage(chatId, '⚠️ 此抽奖已结束或已取消', env);
-  }
-
-  lottery.status = 'cancelled';
-  await env.LOTTERY_KV.put(`lottery:${lotteryId}`, JSON.stringify(lottery));
-
-  return sendMessage(chatId, `✅ 抽奖 \`${lotteryId}\` 已取消`, env);
-}
-
-// ==================== 帮助文本 ====================
-
-async function sendCommandHelp(chatId, env) {
-  return sendMessage(chatId, `
-🎉 **Telegram 抽奖机器人 v3.0**
-
-📋 **常用命令：**
-• \`/create <标题>\` — 创建新抽奖
-• \`/create <标题> - 3人\` — 指定中奖名额
-• \`/join <ID>\` — 参与抽奖
-• \`/draw <ID>\` — 开奖（仅创建者）
-• \`/list\` — 所有抽奖列表
-• \`/info <ID>\` — 抽奖详情
-• \`/my\` — 我参与/创建的抽奖
-• \`/cancel <ID>\` — 取消抽奖（仅创建者）
-
-💡 **提示：** 创建抽奖后，系统会生成按钮，参与者点击即可加入。开奖使用加密安全随机算法，公平公正。
-
-使用 \`/help\` 查看详细使用说明。`, env);
-}
-
-async function sendHelp(chatId, env) {
-  return sendMessage(chatId, `
-📖 **详细帮助**
-
-**🎯 创建抽奖**
-\`/create iPhone 16 抽奖\`
-\`/create 年会大抽奖 - 5个中奖名额\`
-创建后自动生成参与按钮。
-
-**🙋 参与抽奖**
-方式一：点击消息中的「参与抽奖」按钮
-方式二：发送 \`/join <抽奖ID>\`
-
-**🎲 开奖**
-\`/draw <抽奖ID>\`
-随机抽取中奖者。只有创建者可以开奖。
-开奖使用加密安全随机算法（crypto.getRandomValues + Fisher-Yates）。
-
-**📋 查看**
-\`/list\` — 所有抽奖（进行中优先）
-\`/info <ID>\` — 详情
-\`/my\` — 我参与/创建的
-
-**❌ 取消**
-\`/cancel <ID>\`
-仅创建者可取消。
-
----
-🔒 安全特性：Webhook 签名验证 · 幂等防重放 · 乐观锁防并发 · 加密安全随机
-🤖 由 Cloudflare Workers 驱动`, env);
-}
-
-// ==================== 工具函数 ====================
-
-function generateLotteryId() {
-  const buf = new Uint8Array(8);
-  crypto.getRandomValues(buf);
-  return Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
-}
-
-function securePick(arr, count) {
-  // 加密安全 Fisher-Yates
-  const shuffled = [...arr];
-  const byteBuf = new Uint8Array(shuffled.length * 4);
-  for (let i = shuffled.length - 1; i > 0; i--) {
-    crypto.getRandomValues(byteBuf);
-    let rand = 0;
-    for (let b = 0; b < 4; b++) rand = (rand << 8) | byteBuf[b];
-    const j = Math.abs(rand % (i + 1));
-    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-  }
-  return shuffled.slice(0, count);
-}
-
-function fmtDate(ts) {
-  return new Date(ts).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-}
-
-function esc(text) {
-  return String(text).replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, '\\$&');
-}
-
-async function addToChatIndex(env, chatId, lotteryId) {
-  const raw = await env.LOTTERY_KV.get(`chat:${chatId}:lotteries`);
-  let ids = raw ? JSON.parse(raw) : [];
-  ids = ids.filter(id => id !== lotteryId); // 去重
-  ids.unshift(lotteryId);
-  ids = ids.slice(0, 50);
-  await env.LOTTERY_KV.put(`chat:${chatId}:lotteries`, JSON.stringify(ids));
+async function answerCb(cbId, text, env) {
+  return tgApi(env, 'answerCallbackQuery', { callback_query_id: cbId, text });
 }

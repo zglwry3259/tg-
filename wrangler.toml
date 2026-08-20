@@ -3,8 +3,13 @@ main = "src/index.js"
 compatibility_date = "2025-07-01"
 compatibility_flags = ["nodejs_compat"]
 
-# KV namespace 会由 GitHub Actions 自动创建并写入
+# 在 Cloudflare Dashboard 手动创建 KV Namespace，
+# 然后把它的 ID 填到下面两处（正式 + 预览用同一个即可）
 [[kv_namespaces]]
 binding = "LOTTERY_KV"
-id = "f21881ccbcfc44cdb0dc004e5fa94631"
-preview_id = "f21881ccbcfc44cdb0dc004e5fa94631"
+id = "REPLACE_KV_ID"
+preview_id = "REPLACE_PREVIEW_ID"
+
+# 定时开奖检查（每分钟）
+[triggers]
+crons = ["* * * * *"]
