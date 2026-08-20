@@ -164,7 +164,7 @@ async function handleMessage(msg, env) {
       if (deepLink === 'notify' || deepLink === '开启提醒') {
         return sendMessage(chatId, '🔔 **中奖私信提醒已开启！**\n\n以后你参与的抽奖开奖后，中奖结果会第一时间私信通知你～\n（本提示仅需开启一次，之后所有抽奖自动生效）', env);
       }
-      return sendMessage(chatId, '🎉 **群组管家 v6.0**\n\n📌 所有功能都在**私聊**向我发起，发布到你选择的群：\n\n✨ `/create` 创建抽奖（8步向导）\n📢 `/announce 内容` 发布群公告（自动置顶）\n📊 `/poll 问题|选项1|选项2|...` 发起群投票\n\n📋 `/list` 我创建的抽奖\n🎲 `/draw ID` 手动开奖 · ❌ `/cancel ID` 取消\n🤖 `/groups` 查看我已加入的群', env);
+      return sendMessage(chatId, '🎉 **群组管家 v6.1**\n\n📌 所有功能都在**私聊**向我发起，发布到你选择的群：\n\n✨ `/create` 创建抽奖（向导）\n📢 `/announce` 发布群公告（自动置顶）\n📊 `/poll` 发起群投票\n\n📋 `/list` 我创建的抽奖\n🎲 `/draw ID` 手动开奖 · ❌ `/cancel ID` 取消\n🤖 `/groups` 查看我已加入的群\n\n💡 输入 `/announce` 或 `/poll` 后，按提示发送内容即可', env);
     }
     if (cmdLower === '/create') {
       return startWizard(chatId, userId, username, chatTitle, env);
@@ -193,8 +193,20 @@ async function handleMessage(msg, env) {
     return;
   }
 
-  // ---- 私聊：向导步骤 / 投票 / 公告 草稿 ----
+  // ---- 私聊：向导步骤 / 投票 / 公告 草稿 / 待输入内容 ----
   if (chatType === 'private') {
+    // 公告待输入：把本条消息当公告内容
+    const announcePending = await env.LOTTERY_KV.get(`announce_pending:${userId}`);
+    if (announcePending) {
+      await env.LOTTERY_KV.delete(`announce_pending:${userId}`);
+      return announceCmd(chatId, userId, text, env, chatTitle);
+    }
+    // 投票待输入：把本条消息当投票内容
+    const pollPending = await env.LOTTERY_KV.get(`poll_pending:${chatId}`);
+    if (pollPending) {
+      await env.LOTTERY_KV.delete(`poll_pending:${chatId}`);
+      return pollCmd(chatId, text, env);
+    }
     // 投票草稿：等待选择发布群（可点按钮或手动输入群ID）
     const pollDraft = await env.LOTTERY_KV.get(`poll_draft:${chatId}`);
     if (pollDraft) {
@@ -388,14 +400,17 @@ function allPermissionsObject(whole) {
 
 // ==================== 管理员公告（私聊发起） ====================
 
-// /announce：私聊输入公告内容 → 选择发布群 → bot 发公告并置顶
+// /announce：私聊发起 → 提示输入内容 → 选择发布群 → bot 发公告并置顶
 async function announceCmd(chatId, userId, text, env, chatTitle) {
   if (chatId < 0) {
-    return sendMessage(chatId, '📢 发布公告请**私聊机器人**：\n\n`/announce 公告内容`\n\n发布后自动置顶，并校验你是目标群管理员。', env);
+    return sendMessage(chatId, '📢 发布公告请**私聊机器人**：\n\n直接发送 `/announce`，按提示输入公告内容。\n\n发布后自动置顶，并校验你是目标群管理员。', env);
   }
   const content = (text || '').trim();
   if (!content) {
-    return sendMessage(chatId, '📢 **管理员公告**\n\n用法：`/announce 公告内容`\n\n💡 示例：`/announce 本周六晚8点群活动，欢迎参加！`', env);
+    // 进入待输入状态：下一条消息作为公告内容
+    await env.LOTTERY_KV.put(`announce_pending:${userId}`, '1', { expirationTtl: 900 });
+    const kb = [[{ text: '❌ 取消', callback_data: 'cancel_announce_pending' }]];
+    return sendMsgKb(chatId, '📢 **管理员公告**\n\n请直接发送**公告内容**：\n\n💡 示例：`本周六晚8点群活动，欢迎参加！`', kb, env);
   }
   if (content.length > 1000) {
     return sendMessage(chatId, '❌ 公告过长（≤1000字），请精简后重试', env);
@@ -423,7 +438,7 @@ async function publishAnnounce(chatId, userId, targetGroupId, msgId, env) {
 
   const draft = raw ? JSON.parse(raw) : null;
   if (!draft || !draft.content) {
-    await editMsg(chatId, msgId, '⏰ 公告草稿已过期，请重新发送 `/announce 内容`', env);
+    await editMsg(chatId, msgId, '⏰ 公告草稿已过期，请重新发送 `/announce` 再输入内容', env);
     return { ok: false, reason: 'expired' };
   }
 
@@ -441,13 +456,16 @@ async function publishAnnounce(chatId, userId, targetGroupId, msgId, env) {
 
 // ==================== 投票（私聊发起） ====================
 
-// /poll：私聊输入 问题|选项1|选项2 → 选择发布群 → bot 在群里发原生投票
+// /poll：私聊发起 → 提示输入内容 → 选择发布群 → bot 在群里发原生投票
 async function pollCmd(chatId, text, env) {
   if (chatId < 0) {
-    return sendMessage(chatId, '📊 发起投票请**私聊机器人**：\n\n`/poll 问题|选项1|选项2|...`\n\n💡 示例：`/poll 今晚吃什么？|火锅|烧烤|日料`\n⚡ 多选：`/poll --multi 喜欢哪些？|A|B|C`', env);
+    return sendMessage(chatId, '📊 发起投票请**私聊机器人**：\n\n直接发送 `/poll`，按提示输入投票内容。', env);
   }
   if (!(text || '').trim()) {
-    return sendMessage(chatId, '📊 **发起投票**\n\n用法：`/poll 问题|选项1|选项2|...`\n\n💡 示例：`/poll 今晚吃什么？|火锅|烧烤|日料`\n⚡ 多选：`/poll --multi 喜欢哪些？|A|B|C`\n📌 需要 问题 + 至少2个选项', env);
+    // 进入待输入状态：下一条消息作为投票内容
+    await env.LOTTERY_KV.put(`poll_pending:${chatId}`, '1', { expirationTtl: 900 });
+    const kb = [[{ text: '❌ 取消', callback_data: 'cancel_poll_pending' }]];
+    return sendMsgKb(chatId, '📊 **发起投票**\n\n请直接发送：`问题|选项1|选项2|...`\n\n💡 示例：`今晚吃什么？|火锅|烧烤|日料`\n⚡ 多选：`--multi 喜欢哪些？|A|B|C`\n📌 需要 问题 + 至少2个选项', kb, env);
   }
 
   let multi = false;
@@ -485,7 +503,7 @@ async function publishPoll(chatId, userId, targetGroupId, msgId, env) {
 
   const draft = raw ? JSON.parse(raw) : null;
   if (!draft || !draft.question) {
-    await editMsg(chatId, msgId, '⏰ 投票草稿已过期，请重新发送 `/poll ...`', env);
+    await editMsg(chatId, msgId, '⏰ 投票草稿已过期，请重新发送 `/poll` 再输入内容', env);
     return { ok: false, reason: 'expired' };
   }
 
@@ -540,7 +558,7 @@ async function resolveAnnounceGroup(chatId, text, env) {
   }
   const raw = await env.LOTTERY_KV.get(`announce_draft:${chatId}`);
   await env.LOTTERY_KV.delete(`announce_draft:${chatId}`);
-  if (!raw) return sendMessage(chatId, '⏰ 公告草稿已过期，请重新发送 `/announce 内容`');
+  if (!raw) return sendMessage(chatId, '⏰ 公告草稿已过期，请重新发送 `/announce` 再输入内容');
   const draft = JSON.parse(raw);
   const post = `📢 **群公告**\n\n${draft.content}\n\n— ${'群管理组'}`;
   const res = await sendMessage(resolved, post, env);
@@ -561,7 +579,7 @@ async function resolvePollGroup(chatId, text, env) {
   }
   const raw = await env.LOTTERY_KV.get(`poll_draft:${chatId}`);
   await env.LOTTERY_KV.delete(`poll_draft:${chatId}`);
-  if (!raw) return sendMessage(chatId, '⏰ 投票草稿已过期，请重新发送 `/poll ...`');
+  if (!raw) return sendMessage(chatId, '⏰ 投票草稿已过期，请重新发送 `/poll` 再输入内容');
   const draft = JSON.parse(raw);
   const res = await tgApi(env, 'sendPoll', {
     chat_id: resolved,
@@ -640,6 +658,25 @@ async function startWizard(chatId, userId, username, chatTitle, env) {
   return sendMsgKb(chatId, `🎯 **抽奖创建向导**（第1步/共8步）\n\n📝 请输入**抽奖活动名称**：`, kb, env);
 }
 
+// 第7步：选择发布群（按钮）— 供「输入时间/人数」和「快捷时间按钮」复用
+async function showWizardGroupPicker(chatId, userId, wizard, confirmText, env) {
+  const wizardKey = `wizard:${userId}`;
+  wizard.step = 7;
+  await env.LOTTERY_KV.put(wizardKey, JSON.stringify(wizard), { expirationTtl: 3600 });
+
+  const kb = [[{ text: '❌ 取消创建', callback_data: 'cancel_wizard' }]];
+  const groups = await getBotGroups(env);
+  if (groups.length === 0) {
+    return sendMsgKb(chatId, `⚠️ **还未找到可发布群**\n\n请先把机器人**加入目标群组**（并设为管理员），然后发送 \`/groups\` 刷新，或直接输入群 ID（如 \`-1001234567890\`）。`, kb, env);
+  }
+  const groupKb = [];
+  for (const g of groups.slice(0, 12)) {
+    groupKb.push([{ text: `📢 ${esc(g.title || g.id)}`, callback_data: `select_group:${g.id}` }]);
+  }
+  groupKb.push([{ text: '❌ 取消创建', callback_data: 'cancel_wizard' }]);
+  return sendMsgKb(chatId, `✅ ${confirmText}\n\n📢 第7步：请选择**公告发布群**（公告发到该群，参与也在此群）：`, groupKb, env);
+}
+
 async function handleWizardStep(chatId, userId, text, env) {
   const wizardKey = `wizard:${userId}`;
   const raw = await env.LOTTERY_KV.get(wizardKey);
@@ -689,16 +726,19 @@ async function handleWizardStep(chatId, userId, text, env) {
 
     case 6: // 开奖条件值
       if (wizard.data.triggerType === 'time') {
-        const timeMatch = text.match(/(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s+(\d{1,2}):(\d{2})/);
-        if (!timeMatch) {
-          return sendMsgKb(chatId, '❌ 时间格式错误，请使用格式：`2024-12-25 20:00`', kb, env);
+        let targetTime = parseRelativeTime(text);
+        if (targetTime === null) {
+          const timeMatch = text.match(/(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s+(\d{1,2}):(\d{2})/);
+          if (!timeMatch) {
+            return sendMsgKb(chatId, '❌ 时间格式错误，请输入：\n`10分钟后` / `1小时后` / `1天后` / `1周后`\n或具体时间：`2026-08-25 20:00`', kb, env);
+          }
+          const [, y, m, d, h, min] = timeMatch;
+          targetTime = new Date(+y, +m - 1, +d, +h, +min, 0).getTime();
         }
-        const [, y, m, d, h, min] = timeMatch;
-        const targetTime = new Date(+y, +m - 1, +d, +h, +min, 0);
         if (targetTime <= Date.now()) {
           return sendMsgKb(chatId, '❌ 开奖时间必须在当前时间之后', kb, env);
         }
-        wizard.data.triggerValue = targetTime.getTime();
+        wizard.data.triggerValue = targetTime;
       } else {
         const count = parseInt(text);
         if (isNaN(count) || count < 2 || count > 1000) {
@@ -707,22 +747,10 @@ async function handleWizardStep(chatId, userId, text, env) {
         wizard.data.triggerValue = count;
       }
 
-      wizard.step = 7;
-      await env.LOTTERY_KV.put(wizardKey, JSON.stringify(wizard), { expirationTtl: 3600 });
-
-      // 列出 bot 已加入的群供选择，或手动输入群 ID/链接
-      const groups = await getBotGroups(env);
-      if (groups.length === 0) {
-        return sendMsgKb(chatId, `⚠️ **还未找到可发布群**\n\n请先把机器人**加入目标群组**（并设为管理员），然后发送 \`/groups\` 刷新，或直接输入群 ID（如 \`-1001234567890\`）。`, kb, env);
-      }
-      const groupKb = [];
-      for (const g of groups.slice(0, 12)) {
-        groupKb.push([{ text: `📢 ${esc(g.title || g.id)}`, callback_data: `select_group:${g.id}` }]);
-      }
-      groupKb.push([{ text: '❌ 取消创建', callback_data: 'cancel_wizard' }]);
-      return sendMsgKb(chatId, `✅ ${
-        wizard.data.triggerType === 'time' ? '开奖时间' : '人数上限'
-      }：\`${text}\`\n\n📢 第7步：请选择**公告发布群**（公告发到该群，参与也在此群）：`, groupKb, env);
+      const confirmText = wizard.data.triggerType === 'time'
+        ? `开奖时间：\`${fmtDate(wizard.data.triggerValue)}\``
+        : `人数上限：\`${wizard.data.triggerValue}\``;
+      return showWizardGroupPicker(chatId, userId, wizard, confirmText, env);
 
     case 7: // 选择发布群（也可手动输入群ID/链接）
       const rawGroup = text.trim();
@@ -801,11 +829,35 @@ async function handleCallbackQuery(cb, env) {
       await env.LOTTERY_KV.put(wizardKey, JSON.stringify(wizard), { expirationTtl: 3600 });
 
       if (param === 'time') {
-        await editMsg(chatId, msgId, `⏰ **定时开奖**\n\n请输入开奖时间（格式：\`2024-12-25 20:00\`，24小时制）：`, env);
+        const timeKb = [
+          [{ text: '⏱️ 10分钟后', callback_data: 'wizard_time:10m' }],
+          [{ text: '⏱️ 1小时后', callback_data: 'wizard_time:1h' }],
+          [{ text: '⏱️ 1天后', callback_data: 'wizard_time:1d' }],
+          [{ text: '⏱️ 1周后', callback_data: 'wizard_time:1w' }],
+          [{ text: '❌ 取消创建', callback_data: 'cancel_wizard' }],
+        ];
+        await editMsg(chatId, msgId, `⏰ **定时开奖**\n\n点选快捷时间按钮，或直接输入：\n\`10分钟后\` / \`1小时后\` / \`1天后\` / \`1周后\`\n或具体时间：\`2026-08-25 20:00\``, env, timeKb);
       } else {
         await editMsg(chatId, msgId, `👥 **人数开奖**\n\n请输入参与人数上限（到达后自动开奖，例如：\`50\`）：`, env);
       }
       return answerCb(cb.id, '', env);
+    }
+
+    // 快捷时间按钮：10m / 1h / 1d / 1w
+    if (action === 'wizard_time') {
+      const wizardKey = `wizard:${userId}`;
+      const raw = await env.LOTTERY_KV.get(wizardKey);
+      if (!raw) return answerCb(cb.id, '⏰ 会话已过期，请重新 /create', env);
+      const wizard = JSON.parse(raw);
+      const unitMap = { m: 60 * 1000, h: 60 * 60 * 1000, d: 24 * 60 * 60 * 1000, w: 7 * 24 * 60 * 60 * 1000 };
+      const num = parseInt(param);
+      const unit = param.replace(/^\d+/, '');
+      const ms = unitMap[unit];
+      if (!ms || isNaN(num)) return answerCb(cb.id, '无效时间', env);
+      wizard.data.triggerValue = Date.now() + num * ms;
+      const confirmText = `开奖时间：\`${fmtDate(wizard.data.triggerValue)}\``;
+      await showWizardGroupPicker(chatId, userId, wizard, confirmText, env);
+      return answerCb(cb.id, `✅ ${fmtDate(wizard.data.triggerValue)}`, env);
     }
 
     if (action === 'select_group') {
@@ -915,6 +967,13 @@ async function handleCallbackQuery(cb, env) {
       await env.LOTTERY_KV.delete(`announce_draft:${userId}`);
       await env.LOTTERY_KV.delete(`poll_draft:${userId}`);
       await editMsg(chatId, msgId, '❌ 已取消发布', env);
+      return answerCb(cb.id, '已取消', env);
+    }
+
+    if (action === 'cancel_announce_pending' || action === 'cancel_poll_pending') {
+      await env.LOTTERY_KV.delete(`announce_pending:${userId}`);
+      await env.LOTTERY_KV.delete(`poll_pending:${userId}`);
+      await editMsg(chatId, msgId, '❌ 已取消', env);
       return answerCb(cb.id, '已取消', env);
     }
 
@@ -1326,6 +1385,21 @@ function fmtDate(ts) {
   const d = new Date(ts);
   const pad = n => n.toString().padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// 解析相对时间：10分钟后 / 1小时后 / 1天后 / 1周后（也支持不带“后”）
+function parseRelativeTime(text) {
+  const t = (text || '').trim();
+  const m = t.match(/^(\d{1,4})\s*(分钟|小时|天|周|星期|min|h|d|w|m)\s*(后)?$/i);
+  if (!m) return null;
+  const n = parseInt(m[1]);
+  const unit = m[2].toLowerCase();
+  const now = Date.now();
+  if (unit === '分钟' || unit === 'min' || unit === 'm') return now + n * 60 * 1000;
+  if (unit === '小时' || unit === 'h') return now + n * 60 * 60 * 1000;
+  if (unit === '天' || unit === 'd') return now + n * 24 * 60 * 60 * 1000;
+  if (unit === '周' || unit === '星期' || unit === 'w') return now + n * 7 * 24 * 60 * 60 * 1000;
+  return null;
 }
 
 function esc(text) {
