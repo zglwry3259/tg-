@@ -45,13 +45,15 @@ export default {
 // 首次运行时自动设置 Bot 指令菜单（setMyCommands），KV 标记只执行一次
 async function ensureCommands(env) {
   try {
-    const flag = await env.LOTTERY_KV.get('commands_set_v5');
+    const flag = await env.LOTTERY_KV.get('commands_set_v6');
     if (flag === '1') return;
 
     const token = env.BOT_TOKEN || '';
     const url = `${TELEGRAM_API}/bot${token}/setMyCommands`;
     const privateCommands = [
       { command: 'create', description: '✨ 创建抽奖（8步向导）' },
+      { command: 'announce', description: '📢 发布群公告（私聊发起）' },
+      { command: 'poll', description: '📊 发起群投票（私聊发起）' },
       { command: 'list', description: '📋 查看我创建的抽奖' },
       { command: 'draw', description: '🎲 手动开奖 用法: /draw <ID>' },
       { command: 'cancel', description: '❌ 取消抽奖 用法: /cancel <ID>' },
@@ -62,8 +64,6 @@ async function ensureCommands(env) {
       { command: 'list', description: '📋 查看本群抽奖' },
       { command: 'draw', description: '🎲 手动开奖 用法: /draw <ID>' },
       { command: 'cancel', description: '❌ 取消抽奖 用法: /cancel <ID>' },
-      { command: 'announce', description: '📢 管理员公告（自动置顶）' },
-      { command: 'poll', description: '📊 发起投票 用法: /poll 问题|选项1|选项2' },
       { command: 'verify', description: '🛡️ 入群验证开关: /verify on|off' },
     ];
 
@@ -164,7 +164,7 @@ async function handleMessage(msg, env) {
       if (deepLink === 'notify' || deepLink === '开启提醒') {
         return sendMessage(chatId, '🔔 **中奖私信提醒已开启！**\n\n以后你参与的抽奖开奖后，中奖结果会第一时间私信通知你～\n（本提示仅需开启一次，之后所有抽奖自动生效）', env);
       }
-      return sendMessage(chatId, '🎉 **抽奖机器人 v4.1**\n\n私聊中发送 /create 即可创建抽奖，创建后公告会发布到你选择的群聊（和频道）！', env);
+      return sendMessage(chatId, '🎉 **群组管家 v6.0**\n\n📌 所有功能都在**私聊**向我发起，发布到你选择的群：\n\n✨ `/create` 创建抽奖（8步向导）\n📢 `/announce 内容` 发布群公告（自动置顶）\n📊 `/poll 问题|选项1|选项2|...` 发起群投票\n\n📋 `/list` 我创建的抽奖\n🎲 `/draw ID` 手动开奖 · ❌ `/cancel ID` 取消\n🤖 `/groups` 查看我已加入的群', env);
     }
     if (cmdLower === '/create') {
       return startWizard(chatId, userId, username, chatTitle, env);
@@ -193,8 +193,18 @@ async function handleMessage(msg, env) {
     return;
   }
 
-  // ---- 私聊：向导步骤 ----
+  // ---- 私聊：向导步骤 / 投票 / 公告 草稿 ----
   if (chatType === 'private') {
+    // 投票草稿：等待选择发布群（可点按钮或手动输入群ID）
+    const pollDraft = await env.LOTTERY_KV.get(`poll_draft:${chatId}`);
+    if (pollDraft) {
+      return resolvePollGroup(chatId, text, env);
+    }
+    // 公告草稿：等待选择发布群
+    const announceDraft = await env.LOTTERY_KV.get(`announce_draft:${chatId}`);
+    if (announceDraft) {
+      return resolveAnnounceGroup(chatId, text, env);
+    }
     return handleWizardStep(chatId, userId, text, env);
   }
 
@@ -376,42 +386,72 @@ function allPermissionsObject(whole) {
   return perms;
 }
 
-// ==================== 管理员公告 ====================
+// ==================== 管理员公告（私聊发起） ====================
 
-// /announce 公告：仅群管理员可用，发布后自动置顶
+// /announce：私聊输入公告内容 → 选择发布群 → bot 发公告并置顶
 async function announceCmd(chatId, userId, text, env, chatTitle) {
-  if (chatId > 0) {
-    return sendMessage(chatId, '❌ 公告请在群聊中使用：`/announce 公告内容`', env);
+  if (chatId < 0) {
+    return sendMessage(chatId, '📢 发布公告请**私聊机器人**：\n\n`/announce 公告内容`\n\n发布后自动置顶，并校验你是目标群管理员。', env);
   }
-  const admin = await getChatMemberStatus(chatId, userId, env);
-  if (admin !== 'creator' && admin !== 'administrator') {
-    return sendMessage(chatId, '❌ 只有群管理员才能发布公告', env);
+  const content = (text || '').trim();
+  if (!content) {
+    return sendMessage(chatId, '📢 **管理员公告**\n\n用法：`/announce 公告内容`\n\n💡 示例：`/announce 本周六晚8点群活动，欢迎参加！`', env);
   }
-  if (!text.trim()) {
-    return sendMessage(chatId, '📢 用法：`/announce 公告内容`\n发布后自动置顶。', env);
+  if (content.length > 1000) {
+    return sendMessage(chatId, '❌ 公告过长（≤1000字），请精简后重试', env);
   }
 
-  const post = `📢 **群公告**\n\n${text.trim()}\n\n— ${chatTitle || '管理组'}`;
-  const res = await sendMessage(chatId, post, env);
-  // 自动置顶
-  if (res && res.ok && res.result?.message_id) {
-    await tgApi(env, 'pinChatMessage', { chat_id: chatId, message_id: res.result.message_id, disable_notification: true }).catch(() => null);
-  }
+  // 存草稿 → 选择发布群
+  const draftKey = `announce_draft:${userId}`;
+  await env.LOTTERY_KV.put(draftKey, JSON.stringify({ userId, content }), { expirationTtl: 900 });
+  return showGroupPicker(chatId, env, 'announce_publish');
 }
 
-// ==================== 投票 ====================
+// 群选择按钮回调：发布公告
+async function publishAnnounce(chatId, userId, targetGroupId, msgId, env) {
+  const draftKey = `announce_draft:${userId}`;
+  const raw = await env.LOTTERY_KV.get(draftKey);
+  // 先清理草稿
+  await env.LOTTERY_KV.delete(draftKey);
 
-// /poll 投票：问题|选项1|选项2|... 可选 --multi 多选
-async function pollCmd(chatId, text, env) {
-  if (chatId > 0) {
-    return sendMessage(chatId, '❌ 投票请在群聊中使用：`/poll 问题|选项1|选项2|...`', env);
+  // 校验发起者是目标群管理员
+  const status = await getChatMemberStatus(targetGroupId, userId, env);
+  if (status !== 'creator' && status !== 'administrator') {
+    await editMsg(chatId, msgId, '❌ 你不是该群的管理员，无法在此群发布公告。', env);
+    return { ok: false, reason: 'not_admin' };
   }
-  if (!text.trim()) {
-    return sendMessage(chatId, '📊 用法：`/poll 问题|选项1|选项2|...`\n\n💡 示例：`/poll 今晚吃什么？|火锅|烧烤|日料`\n⚡ 多选：`/poll --multi 喜欢哪些？|A|B|C`', env);
+
+  const draft = raw ? JSON.parse(raw) : null;
+  if (!draft || !draft.content) {
+    await editMsg(chatId, msgId, '⏰ 公告草稿已过期，请重新发送 `/announce 内容`', env);
+    return { ok: false, reason: 'expired' };
+  }
+
+  const post = `📢 **群公告**\n\n${draft.content}\n\n— ${'群管理组'}`;
+  const res = await sendMessage(targetGroupId, post, env);
+  if (res && res.ok && res.result?.message_id) {
+    // 自动置顶
+    await tgApi(env, 'pinChatMessage', { chat_id: targetGroupId, message_id: res.result.message_id, disable_notification: true }).catch(() => null);
+    await editMsg(chatId, msgId, `✅ 公告已发布并置顶！\n\n📢 发布群：\`${targetGroupId}\``, env);
+    return { ok: true };
+  }
+  await editMsg(chatId, msgId, '❌ 发布失败：请确认 bot 在该群且有发送权限。', env);
+  return { ok: false, reason: 'send_failed' };
+}
+
+// ==================== 投票（私聊发起） ====================
+
+// /poll：私聊输入 问题|选项1|选项2 → 选择发布群 → bot 在群里发原生投票
+async function pollCmd(chatId, text, env) {
+  if (chatId < 0) {
+    return sendMessage(chatId, '📊 发起投票请**私聊机器人**：\n\n`/poll 问题|选项1|选项2|...`\n\n💡 示例：`/poll 今晚吃什么？|火锅|烧烤|日料`\n⚡ 多选：`/poll --multi 喜欢哪些？|A|B|C`', env);
+  }
+  if (!(text || '').trim()) {
+    return sendMessage(chatId, '📊 **发起投票**\n\n用法：`/poll 问题|选项1|选项2|...`\n\n💡 示例：`/poll 今晚吃什么？|火锅|烧烤|日料`\n⚡ 多选：`/poll --multi 喜欢哪些？|A|B|C`\n📌 需要 问题 + 至少2个选项', env);
   }
 
   let multi = false;
-  let body = text.trim();
+  let body = (text || '').trim();
   const flagMatch = body.match(/^--(multi|anonymous|open)\b/);
   if (flagMatch) {
     multi = flagMatch[1] === 'multi';
@@ -431,14 +471,114 @@ async function pollCmd(chatId, text, env) {
     if (o.length > 100) return sendMessage(chatId, '❌ 单个选项不能超过100字', env);
   }
 
-  return tgApi(env, 'sendPoll', {
-    chat_id: chatId,
-    question,
-    options,
-    is_anonymous: true,
-    allows_multiple_answers: multi,
-  });
+  // 存草稿 → 选择发布群
+  const draftKey = `poll_draft:${chatId}`;
+  await env.LOTTERY_KV.put(draftKey, JSON.stringify({ userId: chatId, question, options, multi }), { expirationTtl: 900 });
+  return showGroupPicker(chatId, env, 'poll_publish');
 }
+
+// 群选择按钮回调：发布投票
+async function publishPoll(chatId, userId, targetGroupId, msgId, env) {
+  const draftKey = `poll_draft:${userId}`;
+  const raw = await env.LOTTERY_KV.get(draftKey);
+  await env.LOTTERY_KV.delete(draftKey);
+
+  const draft = raw ? JSON.parse(raw) : null;
+  if (!draft || !draft.question) {
+    await editMsg(chatId, msgId, '⏰ 投票草稿已过期，请重新发送 `/poll ...`', env);
+    return { ok: false, reason: 'expired' };
+  }
+
+  const res = await tgApi(env, 'sendPoll', {
+    chat_id: targetGroupId,
+    question: draft.question,
+    options: draft.options,
+    is_anonymous: true,
+    allows_multiple_answers: draft.multi,
+  });
+  if (res && res.ok) {
+    await editMsg(chatId, msgId, `✅ 投票已发布到群 \`${targetGroupId}\`！\n\n📊 **${esc(draft.question)}**`, env);
+    return { ok: true };
+  }
+  await editMsg(chatId, msgId, '❌ 发布失败：请确认 bot 在该群且有发送权限。', env);
+  return { ok: false, reason: 'send_failed' };
+}
+
+// ==================== 群选择辅助 ====================
+
+// 展示可发布群列表（按钮）供用户选择；无群时提示手动输入
+async function showGroupPicker(chatId, env, actionPrefix) {
+  const groups = await getBotGroups(env);
+  const kb = [];
+  for (const g of groups.slice(0, 12)) {
+    kb.push([{ text: `📢 ${esc(g.title || g.id)}`, callback_data: `${actionPrefix}:${g.id}` }]);
+  }
+  kb.push([{ text: '❌ 取消', callback_data: 'cancel_group_pick' }]);
+  return sendMsgKb(chatId, `📤 **选择发布群**\n\n点选下方群组（最多显示12个），或直接输入群 ID / t.me 链接：`, kb, env);
+}
+
+// 手动输入群ID/链接时的解析
+async function resolveTargetGroupId(text) {
+  const t = (text || '').trim();
+  if (/^-?\d{5,}$/.test(t)) return parseInt(t);
+  const m = t.match(/t\.me\/([A-Za-z0-9_]+)/);
+  if (m) return m[1]; // 返回 username，供 resolve 时确认
+  if (/^@[A-Za-z0-9_]{3,}$/.test(t)) return t.slice(1);
+  return null;
+}
+
+// 手动输入群ID：公告（无回调消息可编辑，直接发回复）
+async function resolveAnnounceGroup(chatId, text, env) {
+  const resolved = await resolveTargetGroupId(text);
+  if (!resolved || typeof resolved === 'string') {
+    return sendMessage(chatId, '⚠️ 无法识别群标识，请发送群 ID（负整数，如 `-1001234567890`）或 t.me 链接。');
+  }
+  const status = await getChatMemberStatus(resolved, chatId, env);
+  if (status !== 'creator' && status !== 'administrator') {
+    await env.LOTTERY_KV.delete(`announce_draft:${chatId}`);
+    return sendMessage(chatId, '❌ 你不是该群的管理员，无法在此群发布公告。');
+  }
+  const raw = await env.LOTTERY_KV.get(`announce_draft:${chatId}`);
+  await env.LOTTERY_KV.delete(`announce_draft:${chatId}`);
+  if (!raw) return sendMessage(chatId, '⏰ 公告草稿已过期，请重新发送 `/announce 内容`');
+  const draft = JSON.parse(raw);
+  const post = `📢 **群公告**\n\n${draft.content}\n\n— ${'群管理组'}`;
+  const res = await sendMessage(resolved, post, env);
+  if (res && res.ok && res.result?.message_id) {
+    await tgApi(env, 'pinChatMessage', { chat_id: resolved, message_id: res.result.message_id, disable_notification: true }).catch(() => null);
+    await sendMessage(chatId, `✅ 公告已发布并置顶！\n\n📢 发布群：\`${resolved}\``, env);
+    return null;
+  }
+  await sendMessage(chatId, '❌ 发布失败：请确认 bot 在该群且有发送权限。', env);
+  return null;
+}
+
+// 手动输入群ID：投票
+async function resolvePollGroup(chatId, text, env) {
+  const resolved = await resolveTargetGroupId(text);
+  if (!resolved || typeof resolved === 'string') {
+    return sendMessage(chatId, '⚠️ 无法识别群标识，请发送群 ID（负整数，如 `-1001234567890`）或 t.me 链接。');
+  }
+  const raw = await env.LOTTERY_KV.get(`poll_draft:${chatId}`);
+  await env.LOTTERY_KV.delete(`poll_draft:${chatId}`);
+  if (!raw) return sendMessage(chatId, '⏰ 投票草稿已过期，请重新发送 `/poll ...`');
+  const draft = JSON.parse(raw);
+  const res = await tgApi(env, 'sendPoll', {
+    chat_id: resolved,
+    question: draft.question,
+    options: draft.options,
+    is_anonymous: true,
+    allows_multiple_answers: draft.multi,
+  });
+  if (res && res.ok) {
+    await sendMessage(chatId, `✅ 投票已发布到群 \`${resolved}\`！\n\n📊 **${draft.question}**`, env);
+    return null;
+  }
+  await sendMessage(chatId, '❌ 发布失败：请确认 bot 在该群且有发送权限。', env);
+  return null;
+}
+
+// ==================== 其他 ====================
 
 // ==================== 入群验证开关 ====================
 
@@ -745,6 +885,37 @@ async function handleCallbackQuery(cb, env) {
       const name = pending.name || `用户${verifyUserId}`;
       await sendMessage(verifyChatId, `✅ **${esc(name)}** 验证通过，欢迎加入本群！🎉`, env).catch(() => null);
       return answerCb(cb.id, '✅ 验证成功', env);
+    }
+
+    if (action === 'announce_publish') {
+      const targetGroupId = parseInt(param);
+      if (!targetGroupId) return answerCb(cb.id, '无效群ID', env);
+      try {
+        await publishAnnounce(chatId, userId, targetGroupId, msgId, env);
+      } catch (err) {
+        console.log('announce publish error:', err);
+        await editMsg(chatId, msgId, '❌ 发布失败，请稍后重试', env);
+      }
+      return answerCb(cb.id, '', env);
+    }
+
+    if (action === 'poll_publish') {
+      const targetGroupId = parseInt(param);
+      if (!targetGroupId) return answerCb(cb.id, '无效群ID', env);
+      try {
+        await publishPoll(chatId, userId, targetGroupId, msgId, env);
+      } catch (err) {
+        console.log('poll publish error:', err);
+        await editMsg(chatId, msgId, '❌ 发布失败，请稍后重试', env);
+      }
+      return answerCb(cb.id, '', env);
+    }
+
+    if (action === 'cancel_group_pick') {
+      await env.LOTTERY_KV.delete(`announce_draft:${userId}`);
+      await env.LOTTERY_KV.delete(`poll_draft:${userId}`);
+      await editMsg(chatId, msgId, '❌ 已取消发布', env);
+      return answerCb(cb.id, '已取消', env);
     }
 
     await answerCb(cb.id, '', env);

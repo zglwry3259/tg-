@@ -1,7 +1,7 @@
 {
   "name": "tg-group-bot",
-  "version": "5.0.0",
-  "description": "群组管家 v5.0 - 抽奖+入群验证+管理员公告+投票",
+  "version": "6.0.0",
+  "description": "群组管家 v6.0 - 抽奖+入群验证+管理员公告+投票",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
