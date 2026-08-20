@@ -110,6 +110,10 @@ async function handleMessage(msg, env) {
     const [cmd, ...args] = text.split(/\s+/);
     const cmdLower = cmd.toLowerCase();
     if (cmdLower === '/start') {
+      const deepLink = (args[0] || '').toLowerCase();
+      if (deepLink === 'notify' || deepLink === '开启提醒') {
+        return sendMessage(chatId, '🔔 **中奖私信提醒已开启！**\n\n以后你参与的抽奖开奖后，中奖结果会第一时间私信通知你～\n（本提示仅需开启一次，之后所有抽奖自动生效）', env);
+      }
       return sendMessage(chatId, '🎉 **抽奖机器人 v4.1**\n\n私聊中发送 /create 即可创建抽奖，创建后公告会发布到你选择的群聊（和频道）！', env);
     }
     if (cmdLower === '/create') {
@@ -546,7 +550,13 @@ async function checkKeyword(chatId, userId, username, text, chatTitle, env) {
     const count = lottery.participants.length;
     await env.LOTTERY_KV.put(`lottery:${id}`, JSON.stringify(lottery));
 
-    await sendMessage(chatId, `✅ ${esc(username)} 参与成功！「${esc(lottery.name)}」当前 ${count} 人参与 🎯`, env);
+    // 参与成功时提示开启私信提醒（点按钮 t.me/bot?start=notify 后 bot 才能给用户私信）
+      const nbt = await notifyButton(env);
+      if (nbt) {
+        await sendMsgKb(chatId, `✅ ${esc(username)} 参与成功！「${esc(lottery.name)}」当前 ${count} 人参与 🎯\n\n🔔 点击下方按钮开启中奖私信提醒（开奖结果私信送达）：`, nbt, env);
+      } else {
+        await sendMessage(chatId, `✅ ${esc(username)} 参与成功！「${esc(lottery.name)}」当前 ${count} 人参与 🎯`, env);
+      }
 
     // 检查是否需要自动开奖（人数到达）
     if (lottery.triggerType === 'count' && count >= lottery.triggerValue) {
@@ -629,7 +639,8 @@ ${winnerList}
     try { await sendMessage(lottery.channel, groupText, env); } catch {}
   }
 
-  // 私信通知中奖者
+  // 私信通知中奖者（检测失败，不静默）
+  const dmFailed = [];
   for (const winnerId of winners) {
     const name = lottery.participantNames[winnerId] || `用户${winnerId}`;
     const dmText = `🥳🥳 **恭喜中奖啦！** 🥳🥳
@@ -643,8 +654,18 @@ ${winnerList}
 『联系该群管理领取您的奖品吧~』
 
 🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉`;
-    try { await sendMessage(winnerId, dmText, env); }
-    catch { console.log(`Cannot DM ${winnerId}`); }
+    const res = await sendMessage(winnerId, dmText, env);
+    if (!res || !res.ok) {
+      dmFailed.push(winnerId);
+    }
+  }
+
+  // 私信失败的：在群里补一条提示（中奖者需先私聊机器人才能收到通知）
+  if (dmFailed.length > 0) {
+    const failedNames = dmFailed.map(id => lottery.participantNames[id] || `用户${id}`);
+    const tip = `💡 中奖通知私信失败：${failedNames.map(esc).join('、')}\n\n请**私聊机器人**发送任意消息（或点击上一篇参与成功消息里的「🔔 开启中奖私信提醒」按钮），以便接收中奖通知。`;
+    try { await sendMessage(lottery.groupId, tip, env); } catch {}
+    console.log('DM failed for:', dmFailed.join(','));
   }
 
   // 通知创建者
@@ -768,6 +789,28 @@ async function checkBotInChat(chatId, env) {
   } catch {
     return false;
   }
+}
+
+// 获取 bot 用户名（调用 getMe 并缓存到 KV，避免每次请求）
+async function getBotUsername(env) {
+  try {
+    const cached = await env.LOTTERY_KV.get('bot_username');
+    if (cached) return cached;
+    const res = await tgApi(env, 'getMe', {});
+    if (res.ok && res.result?.username) {
+      const uname = res.result.username;
+      await env.LOTTERY_KV.put('bot_username', uname);
+      return uname;
+    }
+  } catch {}
+  return '';
+}
+
+// 构造「开启私信提醒」按钮（t.me/bot?start=notify）
+async function notifyButton(env) {
+  const uname = await getBotUsername(env);
+  if (!uname) return null;
+  return [[{ text: '🔔 开启中奖私信提醒', url: `https://t.me/${uname}?start=notify` }]];
 }
 
 async function addToGroupIndex(env, groupId, lotteryId) {
