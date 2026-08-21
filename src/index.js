@@ -484,9 +484,9 @@ async function handleChatMember(mcm, env) {
   };
   await env.LOTTERY_KV.put(vKey, JSON.stringify(pending), { expirationTtl: 660 });
 
-  // 发送验证提示消息（若有自定义欢迎语则合并，不单独发送）——点击按钮跳转 bot 私聊进行数学验证
+  // 发送验证提示消息（若有自定义欢迎语则合并，不单独发送）——点击按钮跳转 bot 私聊进行验证
   const welcomeText = await getWelcomeText(chat.id, name, env);
-  const text = `👋 欢迎 **${esc(name)}** 加入本群！${welcomeText ? `\n\n${welcomeText}` : ''}\n\n🧮 为防广告/骚扰，请点击下方按钮**跳转到机器人完成数学验证**，10分钟内未验证将被移出群聊。`;
+  const text = `👋 欢迎 **${esc(name)}** 加入本群！${welcomeText ? `\n\n${welcomeText}` : ''}\n\n🧮 为防广告/骚扰，请点击下方按钮**跳转到机器人完成验证**，10分钟内未验证将被移出群聊。`;
   const botUn = await getBotUsername(env);
   const verifyUrl = botUn ? `https://t.me/${botUn}?start=verify_${chat.id}_${userId}` : null;
   const kb = verifyUrl
