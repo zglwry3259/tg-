@@ -186,7 +186,7 @@ async function handleMessage(msg, env) {
         [{ text: '🛡️ 群管理', callback_data: 'menu:mod' }, { text: '⚙️ 设置群组', callback_data: 'menu:groups' }],
         [{ text: '⚙️ 设置频道', callback_data: 'menu:channels' }, { text: '🌏 设置时区', callback_data: 'menu:timezone' }],
       ];
-      return sendMsgKb(chatId, '🎉 **群组管家 v6.7.6**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 🛡️ 群管理 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', menuKb, env);
+      return sendMsgKb(chatId, '🎉 **群组管家 v6.7.8**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 🛡️ 群管理 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', menuKb, env);
     }
     if (cmdLower === '/create') {
       return startWizard(chatId, userId, username, chatTitle, env);
@@ -224,7 +224,7 @@ async function handleMessage(msg, env) {
 
   // ---- 私聊：验证答案 / 群管理向导 / 向导步骤 / 投票 / 公告 草稿 ----
   if (chatType === 'private') {
-    // 有进行中的入群加减法验证 → 优先当答案处理
+    // 有进行中的入群数学验证 → 优先当答案处理
     const handledVerify = await tryVerifyAnswer(chatId, userId, text, env);
     if (handledVerify) return;
 
@@ -277,20 +277,24 @@ async function handleMyChatMember(mcm, env) {
   let list = raw ? JSON.parse(raw) : [];
   if (!Array.isArray(list)) list = [];
 
-  const idx = list.findIndex(g => g.id === chat.id);
+  const idx = list.findIndex(g => String(g.id) === String(chat.id));
   if (newStatus === 'left' || newStatus === 'kicked') {
     if (idx >= 0) list.splice(idx, 1);
   } else if (newStatus === 'member' || newStatus === 'administrator' || newStatus === 'restricted') {
-    const g = { id: chat.id, title: chat.title || (isChannel ? `频道${chat.id}` : `群${chat.id}`) };
+    const prev = idx >= 0 ? list[idx] : null;
+    const prevStatus = prev?.lastStatus || '';
+    const g = { id: chat.id, title: chat.title || (isChannel ? `频道${chat.id}` : `群${chat.id}`), lastStatus: newStatus };
     if (idx >= 0) list[idx] = g;
     else list.push(g);
 
-    // 群内提示：bot 加入/晋升管理员时，检查权限并提醒
-    if (isGroup) {
-      const admin = await isBotAdmin(chat.id, env);
+    // 群内提示：仅在状态变化时提醒一次，避免重复提示
+    // （拉入群=member、设为管理员=administrator 是两次事件，各提示一次；
+    //   私密→公开、重复事件推送等不会再次提醒）
+    if (isGroup && prevStatus !== newStatus) {
+      const admin = newStatus === 'administrator';
       const text = admin
         ? '👋 **大家好，我是群组管家 bot！**\n\n✅ bot 已具备群管理权限，抽奖/入群验证/群管功能可用。\n\n👮 群管理员可私聊 bot 使用 🛡️ 群管理 功能。'
-        : '👋 **大家好，我是群组管家 bot！**\n\n⚠️ **请把我设为群管理员**（成员列表 → 设为管理员，勾选权限）。\n\n否则以下功能不可用：\n🔸 入群验证（加减法防广告，收不到新人入群事件）\n🔸 禁言 / 踢出 / 封禁 等群管操作\n🔸 公告/抽奖 置顶\n\n设好管理员后，bot 会自动发确认消息。';
+        : '👋 **大家好，我是群组管家 bot！**\n\n⚠️ **请把我设为群管理员**（成员列表 → 设为管理员，勾选权限）。\n\n否则以下功能不可用：\n🔸 入群验证（新成员需点击验证按钮，收不到新人入群事件）\n🔸 禁言 / 踢出 / 封禁 等群管操作\n🔸 公告/抽奖 置顶\n\n设好管理员后，bot 会自动发确认消息。';
       await sendMessage(chat.id, text, env).catch(() => {});
     }
   }
@@ -303,9 +307,10 @@ async function getBotGroups(env) {
   let groups = JSON.parse(raw);
   if (!Array.isArray(groups)) return [];
   // 去重：按 id 去重，保留最后的（修复旧版本遗留的重复群组数据）
+  // 注意 id 可能为数字或字符串混存，统一转成字符串比较；保留时归一化为数字
   const seen = new Map();
   for (const g of groups) {
-    seen.set(g.id, g);
+    seen.set(String(g.id), { id: Number(g.id), title: g.title || `群${g.id}` });
   }
   groups = Array.from(seen.values());
   // 同步回 KV 清理脏数据
@@ -316,8 +321,15 @@ async function getBotGroups(env) {
 async function getBotChannels(env) {
   const raw = await env.LOTTERY_KV.get('bot_channels');
   if (!raw) return [];
-  const channels = JSON.parse(raw);
-  return Array.isArray(channels) ? channels : [];
+  let channels = JSON.parse(raw);
+  if (!Array.isArray(channels)) return [];
+  // 同样按 id 去重并归一化 id 为数字，清理旧版脏数据
+  const seen = new Map();
+  for (const c of channels) {
+    seen.set(String(c.id), { id: Number(c.id), title: c.title || `频道${c.id}` });
+  }
+  channels = Array.from(seen.values());
+  return channels;
 }
 
 // 用户设置（默认群/默认频道）
@@ -472,14 +484,14 @@ async function handleChatMember(mcm, env) {
   };
   await env.LOTTERY_KV.put(vKey, JSON.stringify(pending), { expirationTtl: 660 });
 
-  // 发送验证提示消息（若有自定义欢迎语则合并，不单独发送）——点击按钮跳转 bot 私聊进行加减法验证
+  // 发送验证提示消息（若有自定义欢迎语则合并，不单独发送）——点击按钮跳转 bot 私聊进行数学验证
   const welcomeText = await getWelcomeText(chat.id, name, env);
-  const text = `👋 欢迎 **${esc(name)}** 加入本群！${welcomeText ? `\n\n${welcomeText}` : ''}\n\n🧮 为防广告/骚扰，请点击下方按钮**跳转到机器人进行加减法验证**，10分钟内未验证将被移出群聊。`;
+  const text = `👋 欢迎 **${esc(name)}** 加入本群！${welcomeText ? `\n\n${welcomeText}` : ''}\n\n🧮 为防广告/骚扰，请点击下方按钮**跳转到机器人完成数学验证**，10分钟内未验证将被移出群聊。`;
   const botUn = await getBotUsername(env);
   const verifyUrl = botUn ? `https://t.me/${botUn}?start=verify_${chat.id}_${userId}` : null;
   const kb = verifyUrl
-    ? [[{ text: '🧮 点击验证（加减法）', url: verifyUrl }]]
-    : [[{ text: '✅ 点我通过验证', callback_data: `verify_join:${chat.id}:${userId}` }]];
+    ? [[{ text: '🧮 点击验证', url: verifyUrl }]]
+    : [[{ text: '✅ 点击验证', callback_data: `verify_join:${chat.id}:${userId}` }]];
   const res = await sendMsgKb(chat.id, text, kb, env).catch(() => null);
   if (res && res.ok && res.result?.message_id) {
     pending.msgId = res.result.message_id;
@@ -787,7 +799,7 @@ async function resolvePollGroup(chatId, text, env) {
 
 // ==================== 入群验证开关 ====================
 
-// 生成一道加减法题目（结果一定非负）
+// 生成一道算术题（结果一定非负）
 function genQuiz() {
   const op = Math.random() < 0.5 ? '+' : '-';
   let a = 1 + Math.floor(Math.random() * 50);
@@ -797,7 +809,7 @@ function genQuiz() {
   return { question: `${a} ${op} ${b}`, answer };
 }
 
-// 深链：t.me/bot?start=verify_<chatId>_<userId> → 私聊开始加减法验证
+// 深链：t.me/bot?start=verify_<chatId>_<userId> → 私聊开始数学验证
 async function handleVerifyStart(chatId, userId, deepLink, env) {
   if (chatId < 0) {
     return sendMessage(chatId, '🧮 请**私聊机器人**完成入群验证：\n\n打开 @' + (deepLink.replace('verify_', '')) + ' 或从群内验证消息点按钮，在私聊里回答问题即可。', env);
@@ -829,7 +841,7 @@ async function handleVerifyStart(chatId, userId, deepLink, env) {
   await env.LOTTERY_KV.put(vKey, JSON.stringify(pending), { expirationTtl: 660 });
 
   const name = pending.name || `用户${targetUserId}`;
-  const qText = `🧮 **入群加减法验证**\n\n👋 你好 **${esc(name)}**！\n\n请回答下面的算术题以完成验证（答错可重试，最多3次）：\n\n**${question} = ?**\n\n📝 直接回复**答案数字**即可。`;
+  const qText = `🧮 **入群验证**\n\n👋 你好 **${esc(name)}**！\n\n请回答下面的算术题以完成验证（答错可重试，最多3次）：\n\n**${question} = ?**\n\n📝 直接回复**答案数字**即可。`;
   return sendMessage(chatId, qText, env);
 }
 
@@ -879,7 +891,7 @@ async function tryVerifyAnswer(chatId, userId, text, env) {
       await tgApi(env, 'deleteMessage', { chat_id: pending.chatId, message_id: pending.msgId }).catch(() => {});
     }
     await sendMessage(chatId, `✅ 验证成功！**${esc(displayName)}** 已解除禁言，欢迎加入本群～ 🎉`, env);
-    await sendMessage(pending.chatId, `✅ **${esc(displayName)}** 已完成加减法验证，欢迎加入本群！🎉`, env).catch(() => {});
+    await sendMessage(pending.chatId, `✅ **${esc(displayName)}** 已完成验证，欢迎加入本群！🎉`, env).catch(() => {});
     return true;
   }
 
@@ -1960,7 +1972,7 @@ async function handleCallbackQuery(cb, env) {
         [{ text: '🛡️ 群管理', callback_data: 'menu:mod' }, { text: '⚙️ 设置群组', callback_data: 'menu:groups' }],
         [{ text: '⚙️ 设置频道', callback_data: 'menu:channels' }, { text: '🌏 设置时区', callback_data: 'menu:timezone' }],
       ];
-      await editMsg(chatId, msgId, '🎉 **群组管家 v6.7.6**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 🛡️ 群管理 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', env, menuKb);
+      await editMsg(chatId, msgId, '🎉 **群组管家 v6.7.8**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 🛡️ 群管理 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', env, menuKb);
       return answerCb(cb.id, '', env);
     }
 
