@@ -183,10 +183,11 @@ async function handleMessage(msg, env) {
       const menuKb = [
         [{ text: '✨ 创建抽奖', callback_data: 'menu:create' }, { text: '📢 发布公告', callback_data: 'menu:announce' }],
         [{ text: '📊 发起投票', callback_data: 'menu:poll' }, { text: '📋 我的抽奖', callback_data: 'menu:list' }],
-        [{ text: '🛡️ 群管理', callback_data: 'menu:mod' }, { text: '⚙️ 设置群组', callback_data: 'menu:groups' }],
-        [{ text: '⚙️ 设置频道', callback_data: 'menu:channels' }, { text: '🌏 设置时区', callback_data: 'menu:timezone' }],
+        [{ text: '🛡️ 群管理', callback_data: 'menu:mod' }, { text: '📢 频道管理', callback_data: 'menu:chmod' }],
+        [{ text: '⚙️ 设置群组', callback_data: 'menu:groups' }, { text: '⚙️ 设置频道', callback_data: 'menu:channels' }],
+        [{ text: '🌏 设置时区', callback_data: 'menu:timezone' }],
       ];
-      return sendMsgKb(chatId, '🎉 **群组管家 v6.7.10**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 🛡️ 群管理 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', menuKb, env);
+      return sendMsgKb(chatId, '🎉 **群组管家 v6.7.11**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告\n📊 发起投票 · 🛡️ 群管理 · 📢 频道管理\n📋 我的抽奖 · ⚙️ 设置默认群组/频道 · 🌏 时区', menuKb, env);
     }
     if (cmdLower === '/create') {
       return startWizard(chatId, userId, username, chatTitle, env);
@@ -236,6 +237,23 @@ async function handleMessage(msg, env) {
     if (announcePending) {
       await env.LOTTERY_KV.delete(`announce_pending:${userId}`);
       return announceCmd(chatId, userId, text, env, chatTitle);
+    }
+    // 频道公告待输入：把本条消息发送到指定频道
+    const chmodAnnounce = await env.LOTTERY_KV.get(`chmod_announce:${userId}`);
+    if (chmodAnnounce) {
+      await env.LOTTERY_KV.delete(`chmod_announce:${userId}`);
+      const channelId = parseInt(chmodAnnounce);
+      if (!channelId || !text) return sendMessage(chatId, '❌ 公告内容不能为空', env);
+      // 检查用户是否是频道管理员
+      const admin = await getChatMemberStatus(channelId, userId, env);
+      if (!isAdminStatus(admin)) return sendMessage(chatId, '❌ 你不是该频道管理员，无法发布公告。', env);
+      const res = await tgApi(env, 'sendMessage', { chat_id: channelId, text: text, parse_mode: 'Markdown' });
+      if (res?.ok) {
+        await sendMessage(chatId, `✅ 公告已发布到频道！\n\n${text.slice(0, 200)}${text.length > 200 ? '...' : ''}`);
+      } else {
+        await sendMessage(chatId, `❌ 发布失败：${res?.description || '未知错误'}`);
+      }
+      return;
     }
     // 投票待输入：把本条消息当投票内容
     const pollPending = await env.LOTTERY_KV.get(`poll_pending:${chatId}`);
@@ -1329,13 +1347,152 @@ async function showModStart(chatId, msgId, env, userId) {
     await editMsg(chatId, msgId, '🛡️ **群管理**\n\n❌ bot 尚未加入任何群。\n请先把 bot 拉进群并设为管理员，再在这里管理。', env);
     return;
   }
+  // 并发检查每个条目的聊天类型，过滤掉频道（旧版本遗留的脏数据）
+  const checks = groups.map(async (g) => {
+    try {
+      const ci = await tgApi(env, 'getChat', { chat_id: g.id });
+      if (ci?.ok && ci.result?.type === 'channel') {
+        // 从 bot_groups 中移除
+        const groupsRaw = await env.LOTTERY_KV.get('bot_groups');
+        if (groupsRaw) {
+          let groupsList = JSON.parse(groupsRaw);
+          if (Array.isArray(groupsList)) {
+            const idx = groupsList.findIndex(x => String(x.id) === String(g.id));
+            if (idx >= 0) groupsList.splice(idx, 1);
+            await env.LOTTERY_KV.put('bot_groups', JSON.stringify(groupsList));
+          }
+        }
+        return null;
+      }
+      return g;
+    } catch { return g; }
+  });
+  const filtered = (await Promise.all(checks)).filter(Boolean);
+  if (!filtered.length) {
+    await editMsg(chatId, msgId, '🛡️ **群管理**\n\n❌ bot 尚未加入任何群。\n请先把 bot 拉进群并设为管理员，再在这里管理。', env);
+    return;
+  }
   const kb = [];
-  for (const g of groups) {
+  for (const g of filtered) {
     kb.push([{ text: `🏘 ${esc(g.title || `群 ${g.id}`)}`, callback_data: `mod_pick:${g.id}` }]);
   }
   kb.push([{ text: '🏠 主菜单', callback_data: 'menu_back' }]);
   await editMsg(chatId, msgId, '🛡️ **群管理**\n\n选择要管理的群：', env, kb);
 }
+
+// ==================== 频道管理（私聊向导） ====================
+
+// 频道管理主入口：列出 bot 已加入的频道
+async function showChannelModStart(chatId, msgId, env, userId) {
+  const raw = await env.LOTTERY_KV.get('bot_channels');
+  let channels = raw ? JSON.parse(raw) : [];
+  if (!Array.isArray(channels)) channels = [];
+  if (!channels.length) {
+    await editMsg(chatId, msgId, '📢 **频道管理**\n\n❌ bot 尚未加入任何频道。\n请先把 bot 拉进频道并设为管理员。', env);
+    return;
+  }
+  const kb = [];
+  for (const c of channels) {
+    kb.push([{ text: `📢 ${esc(c.title || `频道 ${c.id}`)}`, callback_data: `chmod_pick:${c.id}` }]);
+  }
+  kb.push([{ text: '🏠 主菜单', callback_data: 'menu_back' }]);
+  await editMsg(chatId, msgId, '📢 **频道管理**\n\n选择要管理的频道：', env, kb);
+}
+
+// 频道操作菜单（校验管理员）
+async function showChannelActions(chatId, msgId, env, userId, channelId) {
+  const raw = await env.LOTTERY_KV.get('bot_channels');
+  let channels = raw ? JSON.parse(raw) : [];
+  if (!Array.isArray(channels)) channels = [];
+  const c = channels.find(x => x.id === channelId);
+  const cname = c?.title || `频道 ${channelId}`;
+
+  // 检查是否是频道
+  const chatInfo = await tgApi(env, 'getChat', { chat_id: channelId });
+  if (!chatInfo?.ok || chatInfo.result?.type !== 'channel') {
+    await editMsg(chatId, msgId, `📢 **${esc(cname)}**\n\n❌ 这不是一个频道，请使用 🛡️ 群管理 功能。`, env);
+    return;
+  }
+
+  // 检查用户是否是频道管理员
+  const admin = await getChatMemberStatus(channelId, userId, env);
+  if (!isAdminStatus(admin)) {
+    await editMsg(chatId, msgId, `📢 **${esc(cname)}**\n\n❌ 你不是该频道管理员，无法管理。`, env);
+    return;
+  }
+
+  const kb = [
+    [{ text: 'ℹ️ 频道信息', callback_data: `chmod_exec:${channelId}:info` }, { text: '📢 发布公告', callback_data: `chmod_exec:${channelId}:announce` }],
+    [{ text: '🛡️ 管理员列表', callback_data: `chmod_exec:${channelId}:admins` }],
+    [{ text: '⬅️ 返回', callback_data: 'chmod_back_list' }, { text: '🏠 主菜单', callback_data: 'menu_back' }],
+  ];
+  await editMsg(chatId, msgId, `📢 **频道管理** — ${esc(cname)}（\`${channelId}\`）\n\n选择操作：`, env, kb);
+}
+
+// 执行频道操作
+async function chmodExecAction(chatId, msgId, env, userId, channelId, action) {
+  const raw = await env.LOTTERY_KV.get('bot_channels');
+  let channels = raw ? JSON.parse(raw) : [];
+  if (!Array.isArray(channels)) channels = [];
+  const c = channels.find(x => x.id === channelId);
+  const cname = c?.title || `频道 ${channelId}`;
+
+  // 检查管理员
+  const admin = await getChatMemberStatus(channelId, userId, env);
+  if (!isAdminStatus(admin)) {
+    await editMsg(chatId, msgId, `❌ 你不是该频道管理员。`, env);
+    return;
+  }
+
+  if (action === 'info') {
+    const chatInfo = await tgApi(env, 'getChat', { chat_id: channelId });
+    if (chatInfo?.ok) {
+      const r = chatInfo.result;
+      const lines = [
+        `📢 **频道信息** — ${esc(cname)}`,
+        ``,
+        `🆔 ID：\`${channelId}\``,
+        `📛 标题：${esc(r.title || '?')}`,
+        `📝 描述：${r.description ? esc(r.description.slice(0, 200)) : '（无）'}`,
+        `👥 成员数：${r.member_count ?? '?'}`,
+        `🔗 链接：${r.invite_link ? r.invite_link : '（私有）'}`,
+        `📌 类型：${r.type}`,
+      ];
+      await editMsg(chatId, msgId, lines.join('\n'), env);
+    } else {
+      await editMsg(chatId, msgId, `❌ 获取频道信息失败。`, env);
+    }
+    return;
+  }
+
+  if (action === 'announce') {
+    // 保存频道ID到 KV，等待用户输入公告内容
+    await env.LOTTERY_KV.put(`chmod_announce:${userId}`, String(channelId), { expirationTtl: 900 });
+    const kb = [[{ text: '❌ 取消', callback_data: 'chmod_cancel_announce' }]];
+    await editMsg(chatId, msgId, `📢 **发布公告** — ${esc(cname)}\n\n请直接发送**公告内容**：\n\n💡 公告将发送到该频道。`, env, kb);
+    return;
+  }
+
+  if (action === 'admins') {
+    const admins = await tgApi(env, 'getChatAdministrators', { chat_id: channelId });
+    if (admins?.ok && Array.isArray(admins.result)) {
+      const lines = [`🛡️ **频道管理员** — ${esc(cname)}\n`];
+      for (const a of admins.result) {
+        const name = a.user?.first_name || a.user?.username || '?';
+        const role = a.status === 'creator' ? '👑 创建者' : '🛡️ 管理员';
+        lines.push(`${role}：${esc(name)}${a.user?.username ? ` @${a.user.username}` : ''}`);
+      }
+      // 加返回按钮
+      const kb = [[{ text: '⬅️ 返回', callback_data: `chmod_pick:${channelId}` }]];
+      await editMsg(chatId, msgId, lines.join('\n'), env, kb);
+    } else {
+      await editMsg(chatId, msgId, `❌ 获取管理员列表失败。`, env);
+    }
+    return;
+  }
+}
+
+// ==================== 群管理（私聊向导）续 ====================
 
 // 群操作菜单（校验管理员）
 async function showModActions(chatId, msgId, env, userId, groupId) {
@@ -1926,10 +2083,44 @@ async function handleCallbackQuery(cb, env) {
         await showSettingsTimezone(chatId, msgId, env, userId);
         return answerCb(cb.id, '', env);
       }
+      if (param === 'chmod') {
+        await showChannelModStart(chatId, msgId, env, userId);
+        return answerCb(cb.id, '', env);
+      }
       if (param === 'mod') {
         await showModStart(chatId, msgId, env, userId);
         return answerCb(cb.id, '', env);
       }
+    }
+
+    // ============ 频道管理（私聊向导） ============
+    if (action === 'chmod_pick') {
+      const channelId = parseInt(param);
+      if (!channelId) return answerCb(cb.id, '无效频道', env);
+      await showChannelActions(chatId, msgId, env, userId, channelId);
+      return answerCb(cb.id, '', env);
+    }
+
+    if (action === 'chmod_exec') {
+      // param: <channelId>:<action>
+      const ps = param.split(':');
+      const channelId = parseInt(ps[0]);
+      const chmodAction = ps[1] || '';
+      if (!channelId || !chmodAction) return answerCb(cb.id, '无效参数', env);
+      await chmodExecAction(chatId, msgId, env, userId, channelId, chmodAction);
+      return answerCb(cb.id, '', env);
+    }
+
+    if (action === 'chmod_back_list') {
+      await env.LOTTERY_KV.delete(`chmod_announce:${userId}`);
+      await showChannelModStart(chatId, msgId, env, userId);
+      return answerCb(cb.id, '', env);
+    }
+
+    if (action === 'chmod_cancel_announce') {
+      await env.LOTTERY_KV.delete(`chmod_announce:${userId}`);
+      await editMsg(chatId, msgId, '❌ 已取消发布公告', env);
+      return answerCb(cb.id, '已取消', env);
     }
 
     // ============ 群管理（私聊向导） ============
@@ -2011,10 +2202,11 @@ async function handleCallbackQuery(cb, env) {
       const menuKb = [
         [{ text: '✨ 创建抽奖', callback_data: 'menu:create' }, { text: '📢 发布公告', callback_data: 'menu:announce' }],
         [{ text: '📊 发起投票', callback_data: 'menu:poll' }, { text: '📋 我的抽奖', callback_data: 'menu:list' }],
-        [{ text: '🛡️ 群管理', callback_data: 'menu:mod' }, { text: '⚙️ 设置群组', callback_data: 'menu:groups' }],
-        [{ text: '⚙️ 设置频道', callback_data: 'menu:channels' }, { text: '🌏 设置时区', callback_data: 'menu:timezone' }],
+        [{ text: '🛡️ 群管理', callback_data: 'menu:mod' }, { text: '📢 频道管理', callback_data: 'menu:chmod' }],
+        [{ text: '⚙️ 设置群组', callback_data: 'menu:groups' }, { text: '⚙️ 设置频道', callback_data: 'menu:channels' }],
+        [{ text: '🌏 设置时区', callback_data: 'menu:timezone' }],
       ];
-      await editMsg(chatId, msgId, '🎉 **群组管家 v6.7.10**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 🛡️ 群管理 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', env, menuKb);
+      await editMsg(chatId, msgId, '🎉 **群组管家 v6.7.11**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告\n📊 发起投票 · 🛡️ 群管理 · 📢 频道管理\n📋 我的抽奖 · ⚙️ 设置默认群组/频道 · 🌏 时区', env, menuKb);
       return answerCb(cb.id, '', env);
     }
 
