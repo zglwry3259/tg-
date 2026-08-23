@@ -186,7 +186,7 @@ async function handleMessage(msg, env) {
         [{ text: '🛡️ 群管理', callback_data: 'menu:mod' }, { text: '⚙️ 设置群组', callback_data: 'menu:groups' }],
         [{ text: '⚙️ 设置频道', callback_data: 'menu:channels' }, { text: '🌏 设置时区', callback_data: 'menu:timezone' }],
       ];
-      return sendMsgKb(chatId, '🎉 **群组管家 v6.7.9**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 🛡️ 群管理 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', menuKb, env);
+      return sendMsgKb(chatId, '🎉 **群组管家 v6.7.10**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 🛡️ 群管理 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', menuKb, env);
     }
     if (cmdLower === '/create') {
       return startWizard(chatId, userId, username, chatTitle, env);
@@ -307,6 +307,21 @@ async function handleMyChatMember(mcm, env) {
     list = Array.from(seen.values());
   }
   await env.LOTTERY_KV.put(key, JSON.stringify(list));
+
+  // 频道事件：清理 bot_groups 中可能残留的同 id 脏数据（旧版本遗留）
+  if (isChannel) {
+    const groupsRaw = await env.LOTTERY_KV.get('bot_groups');
+    if (groupsRaw) {
+      let groupsList = JSON.parse(groupsRaw);
+      if (Array.isArray(groupsList)) {
+        const groupsIdx = groupsList.findIndex(g => String(g.id) === String(chat.id));
+        if (groupsIdx >= 0) {
+          groupsList.splice(groupsIdx, 1);
+          await env.LOTTERY_KV.put('bot_groups', JSON.stringify(groupsList));
+        }
+      }
+    }
+  }
 }
 
 async function getBotGroups(env) {
@@ -1328,6 +1343,25 @@ async function showModActions(chatId, msgId, env, userId, groupId) {
   const g = groups.find(x => x.id === groupId);
   const gname = g?.title || `群 ${groupId}`;
 
+  // 检查是否为频道（旧版本遗留的脏数据，频道不应出现在群管理列表）
+  const chatInfo = await tgApi(env, 'getChat', { chat_id: groupId });
+  if (chatInfo?.ok && chatInfo.result?.type === 'channel') {
+    // 自动从 bot_groups 中移除
+    const groupsRaw = await env.LOTTERY_KV.get('bot_groups');
+    if (groupsRaw) {
+      let groupsList = JSON.parse(groupsRaw);
+      if (Array.isArray(groupsList)) {
+        const idx = groupsList.findIndex(x => String(x.id) === String(groupId));
+        if (idx >= 0) {
+          groupsList.splice(idx, 1);
+          await env.LOTTERY_KV.put('bot_groups', JSON.stringify(groupsList));
+        }
+      }
+    }
+    await editMsg(chatId, msgId, `📢 **${esc(gname)}** 是一个**频道**，不是群组。\n\n已自动从群管理列表中移除。\n频道管理请使用 ⚙️ 设置频道 功能。`, env);
+    return;
+  }
+
   const admin = await getChatMemberStatus(groupId, userId, env);
   if (!isAdminStatus(admin)) {
     await editMsg(chatId, msgId, `🛡️ **${esc(gname)}**\n\n❌ 你不是该群管理员，无法管理。`, env);
@@ -1980,7 +2014,7 @@ async function handleCallbackQuery(cb, env) {
         [{ text: '🛡️ 群管理', callback_data: 'menu:mod' }, { text: '⚙️ 设置群组', callback_data: 'menu:groups' }],
         [{ text: '⚙️ 设置频道', callback_data: 'menu:channels' }, { text: '🌏 设置时区', callback_data: 'menu:timezone' }],
       ];
-      await editMsg(chatId, msgId, '🎉 **群组管家 v6.7.9**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 🛡️ 群管理 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', env, menuKb);
+      await editMsg(chatId, msgId, '🎉 **群组管家 v6.7.10**\n\n📌 所有功能都在**私聊**向我发起：\n\n✨ 创建抽奖（多奖品/兑奖码） · 📢 发布公告（自动置顶）\n📊 发起投票 · 🛡️ 群管理 · 📋 我的抽奖（内联键盘）\n⚙️ 设置默认群组 / 频道 · 🌏 时区', env, menuKb);
       return answerCb(cb.id, '', env);
     }
 
