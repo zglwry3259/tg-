@@ -1445,25 +1445,29 @@ async function chmodExecAction(chatId, msgId, env, userId, channelId, action) {
   }
 
   if (action === 'info') {
-    const chatInfo = await tgApi(env, 'getChat', { chat_id: channelId });
-    if (chatInfo?.ok) {
-      const r = chatInfo.result;
-      const lines = [
-        `📢 **频道信息** — ${esc(cname)}`,
-        ``,
-        `🆔 ID：\`${channelId}\``,
-        `📛 标题：${esc(r.title || '?')}`,
-        `📝 描述：${r.description ? esc(r.description.slice(0, 200)) : '（无）'}`,
-        `👥 成员数：${r.member_count ?? '?'}`,
-        `🔗 链接：${r.invite_link ? r.invite_link : '（私有）'}`,
-        `📌 类型：${r.type}`,
-      ];
-      await editMsg(chatId, msgId, lines.join('\n'), env);
-    } else {
-      await editMsg(chatId, msgId, `❌ 获取频道信息失败。`, env);
-    }
-    return;
+  const [chatInfo, countInfo] = await Promise.all([
+    tgApi(env, 'getChat', { chat_id: channelId }),
+    tgApi(env, 'getChatMembersCount', { chat_id: channelId }),
+  ]);
+  if (chatInfo?.ok) {
+    const r = chatInfo.result;
+    const memberCount = countInfo.ok ? countInfo.result : '?';
+    const lines = [
+      `📢 **频道信息** — ${esc(cname)}`,
+      ``,
+      `🆔 ID：\`${channelId}\``,
+      `📛 标题：${esc(r.title || '?')}`,
+      `📝 描述：${r.description ? esc(r.description.slice(0, 200)) : '（无）'}`,
+      `👥 成员数：${memberCount}`,
+      `🔗 链接：${r.invite_link ? r.invite_link : '（私有）'}`,
+      `📌 类型：${r.type}`,
+    ];
+    await editMsg(chatId, msgId, lines.join('\n'), env);
+  } else {
+    await editMsg(chatId, msgId, `❌ 获取频道信息失败。`, env);
   }
+  return;
+}
 
   if (action === 'announce') {
     // 保存频道ID到 KV，等待用户输入公告内容
