@@ -1880,7 +1880,21 @@ async function handleCallbackQuery(cb, env) {
       const draftKey = `broadcast_draft:${userId}`;
       const raw = await env.LOTTERY_KV.get(draftKey);
       await env.LOTTERY_KV.delete(draftKey);
-      if (!raw) { await editMsg(chatId, msgId, '⏰ 广播草稿已过期', env); return answerCb(cb.id, '', env); }
+      if (!raw) {
+        await editMsg(chatId, msgId, '⏰ 广播草稿已过期', env);
+        return answerCb(cb.id, '', env);
+      }
       const draft = JSON.parse(raw);
       const groups = await getBotGroups(env);
-      if (!groups.length) { await editMsg(chatId, msgId, '❌ bot 尚未加入任何群
+      if (!groups.length) {
+        await editMsg(chatId, msgId, '❌ bot 尚未加入任何群，无法广播', env);
+        return answerCb(cb.id, '', env);
+      }
+      let success = 0, fail = 0;
+      for (const g of groups) {
+        try {
+          const res = await sendMessage(g.id, `📢 **全局广播**\n\n${draft.content}`, env);
+          if (res && res.ok) success++; else fail++;
+        } catch { fail++; }
+      }
+      await editMsg(chatId, msgId, `✅ **广播完成**\n\n📤 成功：${success} 个群\n❌ 失败：${
