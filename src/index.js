@@ -1897,4 +1897,13 @@ async function handleCallbackQuery(cb, env) {
           if (res && res.ok) success++; else fail++;
         } catch { fail++; }
       }
-      await editMsg(chatId, msgId, `✅ **广播完成**\n\n📤 成功：${success} 个群\n❌ 失败：${
+      await editMsg(chatId, msgId, `✅ **广播完成**\n\n📤 成功：${success} 个群\n❌ 失败：${fail} 个群`, env);
+      return answerCb(cb.id, '✅ 广播完成', env);
+    }
+
+    if (action === 'broadcast_cancel') {
+      await env.LOTTERY_KV.delete(`broadcast_pending:${userId}`);
+      await env.LOTTERY_KV.delete(`broadcast_draft:${userId}`);
+      await editMsg(chatId, msgId, '❌ 已取消广播', env);
+      return answerCb(cb.id, '已取消', env);
+    }
