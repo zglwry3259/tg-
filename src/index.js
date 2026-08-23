@@ -994,9 +994,61 @@ async function handleModCmd(chatId, userId, cmd, arg, msg, chatTitle, env) {
 }
 async function showModStart(chatId, msgId, env, userId) {
   const groups = await getBotGroups(env);
-  if (!groups.length) { await editMsg(chatId, msgId, '🛡️ **群管理**\n\n❌ bot 尚未加入任何群。\n请先把 bot 拉进群并设为管理员，再在这里管理。', env); return; }
+  if (!groups.length) {
+    await editMsg(chatId, msgId, '🛡️ **群管理**\n\n❌ bot 尚未加入任何群。\n请先把 bot 拉进群并设为管理员，再在这里管理。', env);
+    return;
+  }
+
+  // 并发检查并过滤频道/僵尸数据
+  const checks = groups.map(async (g) => {
+    try {
+      const ci = await tgApi(env, 'getChat', { chat_id: g.id });
+      // 判断是否为频道：API 返回 type === 'channel'，或 API 失败但 ID 像频道
+      const isChannel = ci?.ok && ci.result?.type === 'channel';
+      const isLikelyChannel = !ci?.ok && String(g.id).startsWith('-100') && String(g.id).length < 15;
+      if (isChannel || isLikelyChannel) {
+        // 从 bot_groups 中移除
+        const groupsRaw = await env.LOTTERY_KV.get('bot_groups');
+        if (groupsRaw) {
+          let groupsList = JSON.parse(groupsRaw);
+          if (Array.isArray(groupsList)) {
+            const idx = groupsList.findIndex(x => String(x.id) === String(g.id));
+            if (idx >= 0) {
+              groupsList.splice(idx, 1);
+              await env.LOTTERY_KV.put('bot_groups', JSON.stringify(groupsList));
+            }
+          }
+        }
+        return null;
+      }
+      return g;
+    } catch {
+      // getChat 失败也尝试从 KV 中删除（可能是僵尸数据）
+      const groupsRaw = await env.LOTTERY_KV.get('bot_groups');
+      if (groupsRaw) {
+        let groupsList = JSON.parse(groupsRaw);
+        if (Array.isArray(groupsList)) {
+          const idx = groupsList.findIndex(x => String(x.id) === String(g.id));
+          if (idx >= 0) {
+            groupsList.splice(idx, 1);
+            await env.LOTTERY_KV.put('bot_groups', JSON.stringify(groupsList));
+          }
+        }
+      }
+      return null;
+    }
+  });
+
+  const filtered = (await Promise.all(checks)).filter(Boolean);
+  if (!filtered.length) {
+    await editMsg(chatId, msgId, '🛡️ **群管理**\n\n❌ bot 尚未加入任何群。\n请先把 bot 拉进群并设为管理员，再在这里管理。', env);
+    return;
+  }
+
   const kb = [];
-  for (const g of groups) kb.push([{ text: `🏘 ${esc(g.title || `群 ${g.id}`)}`, callback_data: `mod_pick:${g.id}` }]);
+  for (const g of filtered) {
+    kb.push([{ text: `🏘 ${esc(g.title || `群 ${g.id}`)}`, callback_data: `mod_pick:${g.id}` }]);
+  }
   kb.push([{ text: '🏠 主菜单', callback_data: 'menu_back' }]);
   await editMsg(chatId, msgId, '🛡️ **群管理**\n\n选择要管理的群：', env, kb);
 }
